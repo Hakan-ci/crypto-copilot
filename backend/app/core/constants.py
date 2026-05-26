@@ -1,0 +1,9 @@
+SUPPORTED_TIMEFRAMES = ["Min60", "Hour4", "Day1"]
+TIMEFRAME_LABELS = {"Min60": "1H", "Hour4": "4H", "Day1": "1D"}
+SUPPORTED_INDICATORS = ["rsi", "stoch_rsi", "macd", "supertrend"]
+
+MEXC_SIDE_OPEN_LONG = 1
+MEXC_SIDE_CLOSE_SHORT = 2
+MEXC_SIDE_OPEN_SHORT = 3
+MEXC_SIDE_CLOSE_LONG = 4
+
