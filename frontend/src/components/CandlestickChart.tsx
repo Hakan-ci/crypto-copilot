@@ -62,7 +62,7 @@ export function CandlestickChart({ data = [] }: { data?: ChartCandle[] }) {
   if (data.length === 0) {
     return (
       <div className="flex h-72 items-center justify-center rounded-md border border-dashed border-stone-300 bg-white text-center text-sm text-slate-600">
-        Candle chart will appear after a candle-read API is available.
+        Candle chart will appear after snapshots prepare MEXC candles.
       </div>
     );
   }

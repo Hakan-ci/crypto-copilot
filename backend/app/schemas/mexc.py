@@ -76,3 +76,18 @@ class MexcOrderDealsImportResponse(BaseModel):
     imported: int
     skipped_duplicates: int
     symbol: str
+
+
+class MexcImportAndReconstructResponse(MexcOrderDealsImportResponse):
+    positions_created: int
+    open_positions: int
+    closed_positions: int
+    warnings: list[str]
+
+
+class MexcReadinessResponse(BaseModel):
+    base_url: str
+    credentials_configured: bool
+    public_api_reachable: bool
+    private_read_authenticated: bool
+    message: str

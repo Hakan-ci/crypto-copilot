@@ -6,8 +6,7 @@ export default function ConnectMexcPage() {
       <div>
         <h1 className="text-2xl font-semibold text-slate-950">Connect MEXC</h1>
         <p className="mt-1 max-w-2xl text-sm text-slate-600">
-          This MVP prepares the connection flow. Credential storage is intentionally not wired until
-          backend credential management is added.
+          Backend `.env` credentials are used for read-only MEXC Futures history.
         </p>
       </div>
       <MexcConnectionForm />

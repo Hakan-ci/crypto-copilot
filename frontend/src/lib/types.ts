@@ -110,6 +110,35 @@ export interface ImportOrderDealsResponse {
   symbol: string;
 }
 
+export interface ImportAndReconstructResponse extends ImportOrderDealsResponse {
+  positions_created: number;
+  open_positions: number;
+  closed_positions: number;
+  warnings: string[];
+}
+
+export interface MexcReadinessResponse {
+  base_url: string;
+  credentials_configured: boolean;
+  public_api_reachable: boolean;
+  private_read_authenticated: boolean;
+  message: string;
+}
+
+export interface Candle {
+  id: string;
+  exchange: string;
+  symbol: string;
+  timeframe: Timeframe;
+  timestamp: string;
+  timestamp_s: number;
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume: string;
+}
+
 export interface PositionFilters {
   symbol?: string;
   status?: PositionStatus;

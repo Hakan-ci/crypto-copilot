@@ -3,16 +3,16 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BarChart3, RefreshCw } from "lucide-react";
 import { useParams } from "next/navigation";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
-import { CandlestickChart } from "@/components/CandlestickChart";
+import { CandlestickChart, type ChartCandle } from "@/components/CandlestickChart";
 import { EmptyState } from "@/components/EmptyState";
 import { IndicatorSnapshotPanel } from "@/components/IndicatorSnapshotPanel";
 import { MetricCard } from "@/components/MetricCard";
 import { RiskWarnings } from "@/components/RiskWarnings";
 import { TimeframeSelector } from "@/components/TimeframeSelector";
 import { TradeReviewPanel } from "@/components/TradeReviewPanel";
-import { calculateIndicatorSnapshots, getPositionDetail } from "@/lib/api";
+import { calculateIndicatorSnapshots, getPositionDetail, listPositionCandles } from "@/lib/api";
 import { classForPnl, formatCurrency, formatDateTime, formatDecimal } from "@/lib/format";
 import { TIMEFRAMES } from "@/lib/timeframes";
 import type { Timeframe } from "@/lib/types";
@@ -21,10 +21,16 @@ export default function PositionDetailPage() {
   const params = useParams<{ id: string }>();
   const positionId = params.id;
   const [selectedTimeframe, setSelectedTimeframe] = useState<Timeframe | "all">("all");
+  const [chartTimeframe, setChartTimeframe] = useState<Timeframe>("Min60");
   const queryClient = useQueryClient();
   const detailQuery = useQuery({
     queryKey: ["position-detail", positionId],
     queryFn: () => getPositionDetail(positionId),
+    enabled: Boolean(positionId)
+  });
+  const candlesQuery = useQuery({
+    queryKey: ["position-candles", positionId, chartTimeframe],
+    queryFn: () => listPositionCandles(positionId, chartTimeframe),
     enabled: Boolean(positionId)
   });
   const snapshotMutation = useMutation({
@@ -35,8 +41,20 @@ export default function PositionDetailPage() {
       ),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["position-detail", positionId] });
+      void queryClient.invalidateQueries({ queryKey: ["position-candles", positionId] });
     }
   });
+  const chartData = useMemo<ChartCandle[]>(
+    () =>
+      (candlesQuery.data ?? []).map((candle) => ({
+        time: candle.timestamp_s as ChartCandle["time"],
+        open: Number(candle.open),
+        high: Number(candle.high),
+        low: Number(candle.low),
+        close: Number(candle.close)
+      })),
+    [candlesQuery.data]
+  );
 
   if (detailQuery.isLoading) {
     return <EmptyState title="Loading position">Reading position detail and snapshots.</EmptyState>;
@@ -58,6 +76,8 @@ export default function PositionDetailPage() {
     selectedTimeframe === "all"
       ? snapshots
       : snapshots.filter((snapshot) => snapshot.timeframe === selectedTimeframe);
+  const snapshotTimeframes = new Set(snapshots.map((snapshot) => snapshot.timeframe));
+  const snapshotsReady = TIMEFRAMES.every((timeframe) => snapshotTimeframes.has(timeframe.value));
 
   return (
     <div className="space-y-6">
@@ -75,7 +95,7 @@ export default function PositionDetailPage() {
           onClick={() => snapshotMutation.mutate()}
         >
           <RefreshCw className="h-4 w-4" aria-hidden="true" />
-          {snapshotMutation.isPending ? "Refreshing..." : "Calculate snapshots"}
+          {snapshotMutation.isPending ? "Preparing..." : "Prepare snapshots"}
         </button>
       </div>
 
@@ -117,11 +137,29 @@ export default function PositionDetailPage() {
       ) : null}
 
       <section className="space-y-3">
-        <div className="flex items-center gap-2">
-          <BarChart3 className="h-5 w-5 text-teal-700" aria-hidden="true" />
-          <h2 className="text-lg font-semibold text-slate-950">Chart</h2>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-2">
+            <BarChart3 className="h-5 w-5 text-teal-700" aria-hidden="true" />
+            <h2 className="text-lg font-semibold text-slate-950">Chart</h2>
+          </div>
+          <TimeframeSelector
+            value={chartTimeframe}
+            onChange={(value) => {
+              if (value !== "all") {
+                setChartTimeframe(value);
+              }
+            }}
+          />
         </div>
-        <CandlestickChart />
+        {candlesQuery.isError ? (
+          <EmptyState title="Candles could not load">
+            {(candlesQuery.error as Error).message}
+          </EmptyState>
+        ) : candlesQuery.isLoading ? (
+          <EmptyState title="Loading candles">Reading stored MEXC candles.</EmptyState>
+        ) : (
+          <CandlestickChart data={chartData} />
+        )}
       </section>
 
       <RiskWarnings position={position} snapshots={snapshots} />
@@ -148,7 +186,11 @@ export default function PositionDetailPage() {
         )}
       </section>
 
-      <TradeReviewPanel positionId={position.id} review={detail.ai_review} />
+      <TradeReviewPanel
+        positionId={position.id}
+        review={detail.ai_review}
+        snapshotsReady={snapshotsReady}
+      />
     </div>
   );
 }

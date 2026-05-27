@@ -25,6 +25,7 @@ MEXC_SIDE_LABELS = {
 
 KLINE_PATH_TEMPLATE = "/api/v1/contract/kline/{symbol}"
 ORDER_DEALS_PATH = "/api/v1/private/order/list/order_deals/v3"
+PING_PATH = "/api/v1/contract/ping"
 MAX_ORDER_DEALS_PAGE_SIZE = 1000
 
 
@@ -43,7 +44,7 @@ class MexcFuturesClient:
         self,
         access_key: str | None,
         secret_key: str | None,
-        base_url: str = "https://api.mexc.com",
+        base_url: str = "https://contract.mexc.com",
         recv_window_ms: int = 10000,
     ) -> None:
         self.access_key = access_key
@@ -91,6 +92,11 @@ class MexcFuturesClient:
         signature = self._sign(timestamp, clean_params)
         headers = self._private_headers(signature, timestamp)
         return await self._get(path=path, params=clean_params, headers=headers)
+
+    async def ping(self) -> int | None:
+        payload = await self._get_public(PING_PATH, params=None)
+        data = self._extract_data(payload)
+        return int(data) if data is not None else None
 
     async def get_klines(
         self,

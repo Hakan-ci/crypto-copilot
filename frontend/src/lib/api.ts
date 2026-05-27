@@ -1,8 +1,11 @@
 import type {
+  Candle,
   DashboardMetrics,
+  ImportAndReconstructResponse,
   ImportOrderDealsRequest,
   ImportOrderDealsResponse,
   IndicatorSnapshotCalculationResponse,
+  MexcReadinessResponse,
   Position,
   PositionDetail,
   PositionFilters,
@@ -80,11 +83,26 @@ export function getPositionDetail(positionId: string) {
   return request<PositionDetail>(`/positions/${positionId}`);
 }
 
+export function getMexcReadiness(symbol = "BTC_USDT") {
+  return request<MexcReadinessResponse>(`/mexc/readiness${toQueryString({ symbol })}`);
+}
+
 export function importOrderDeals(payload: ImportOrderDealsRequest) {
   return request<ImportOrderDealsResponse>("/mexc/import/order-deals", {
     method: "POST",
     body: JSON.stringify(payload)
   });
+}
+
+export function importOrderDealsAndReconstruct(payload: ImportOrderDealsRequest) {
+  return request<ImportAndReconstructResponse>("/mexc/import/order-deals-and-reconstruct", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function listPositionCandles(positionId: string, timeframe: Timeframe) {
+  return request<Candle[]>(`/positions/${positionId}/candles${toQueryString({ timeframe })}`);
 }
 
 export function calculateIndicatorSnapshots(positionId: string, timeframes: Timeframe[]) {

@@ -42,10 +42,12 @@ function readReview(review: AiTradeReview | null): TradeReviewOutput | null {
 
 export function TradeReviewPanel({
   positionId,
-  review
+  review,
+  snapshotsReady
 }: {
   positionId: string;
   review: AiTradeReview | null;
+  snapshotsReady: boolean;
 }) {
   const queryClient = useQueryClient();
   const mutation = useMutation({
@@ -68,7 +70,7 @@ export function TradeReviewPanel({
         <button
           className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-slate-900 px-4 text-sm font-medium text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
           type="button"
-          disabled={mutation.isPending}
+          disabled={mutation.isPending || !snapshotsReady}
           onClick={() => mutation.mutate()}
         >
           <Sparkles className="h-4 w-4" aria-hidden="true" />
@@ -77,6 +79,11 @@ export function TradeReviewPanel({
       </div>
       {mutation.isError ? (
         <p className="mt-3 text-sm text-red-700">{(mutation.error as Error).message}</p>
+      ) : null}
+      {!snapshotsReady ? (
+        <p className="mt-3 text-sm text-amber-700">
+          Prepare 1H, 4H, and 1D snapshots before generating an AI review.
+        </p>
       ) : null}
       {reviewOutput ? (
         <div className="mt-4 space-y-4">

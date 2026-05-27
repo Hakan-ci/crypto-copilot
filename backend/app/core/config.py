@@ -14,7 +14,7 @@ def parse_cors_allowed_origins(value: str | None) -> list[str]:
 
 class Settings(BaseSettings):
     database_url: str = Field(alias="DATABASE_URL")
-    mexc_base_url: str = Field(default="https://api.mexc.com", alias="MEXC_BASE_URL")
+    mexc_base_url: str = Field(default="https://contract.mexc.com", alias="MEXC_BASE_URL")
     app_env: str = Field(default="development", alias="APP_ENV")
     secret_key: SecretStr = Field(alias="SECRET_KEY")
     api_key_encryption_key: SecretStr = Field(alias="API_KEY_ENCRYPTION_KEY")

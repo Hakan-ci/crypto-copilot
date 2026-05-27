@@ -19,7 +19,7 @@ Edit `.env` with your local PostgreSQL URL and secrets:
 
 ```bash
 DATABASE_URL=postgresql+psycopg://crypto_copilot:crypto_copilot@localhost:5432/crypto_copilot
-MEXC_BASE_URL=https://api.mexc.com
+MEXC_BASE_URL=https://contract.mexc.com
 APP_ENV=development
 CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 SECRET_KEY=replace-with-local-random-value

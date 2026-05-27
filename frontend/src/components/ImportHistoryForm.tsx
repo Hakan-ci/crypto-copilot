@@ -1,10 +1,10 @@
 "use client";
 
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Download } from "lucide-react";
 import { FormEvent, useState } from "react";
 
-import { importOrderDeals } from "@/lib/api";
+import { importOrderDealsAndReconstruct } from "@/lib/api";
 
 function dateToMilliseconds(value: string) {
   if (!value) {
@@ -18,15 +18,20 @@ export function ImportHistoryForm({ userId }: { userId: string }) {
   const [symbol, setSymbol] = useState("BTC_USDT");
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
+  const queryClient = useQueryClient();
 
   const mutation = useMutation({
     mutationFn: () =>
-      importOrderDeals({
+      importOrderDealsAndReconstruct({
         user_id: userId,
         symbol: symbol.trim().toUpperCase(),
         start_time_ms: dateToMilliseconds(start),
         end_time_ms: dateToMilliseconds(end)
-      })
+      }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["dashboard", userId] });
+      void queryClient.invalidateQueries({ queryKey: ["positions", userId] });
+    }
   });
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -71,15 +76,24 @@ export function ImportHistoryForm({ userId }: { userId: string }) {
         disabled={!userId || !symbol.trim() || mutation.isPending}
       >
         <Download className="h-4 w-4" aria-hidden="true" />
-        {mutation.isPending ? "Importing..." : "Import order deals"}
+        {mutation.isPending ? "Preparing..." : "Import and reconstruct"}
       </button>
       {mutation.isError ? (
         <p className="text-sm text-red-700">{(mutation.error as Error).message}</p>
       ) : null}
       {mutation.data ? (
-        <div className="rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
-          Imported {mutation.data.imported} rows for {mutation.data.symbol}. Skipped{" "}
-          {mutation.data.skipped_duplicates} duplicates.
+        <div className="space-y-2 rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+          <p>
+            Imported {mutation.data.imported} rows for {mutation.data.symbol}. Skipped{" "}
+            {mutation.data.skipped_duplicates} duplicates.
+          </p>
+          <p>
+            Reconstructed {mutation.data.positions_created} positions:{" "}
+            {mutation.data.closed_positions} closed / {mutation.data.open_positions} open.
+          </p>
+          {mutation.data.warnings.length ? (
+            <p className="text-amber-900">{mutation.data.warnings.join(" ")}</p>
+          ) : null}
         </div>
       ) : null}
     </form>
