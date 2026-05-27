@@ -8,17 +8,21 @@ from pydantic import SecretStr, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.models import AiTradeReview, FuturesPosition, IndicatorSnapshot
+from app.core.time import utc_now
+from app.db.models import AiTradeQuestion, AiTradeReview, FuturesPosition, IndicatorSnapshot
 from app.schemas.trades import (
+    AiTradeQuestionRead,
     IndicatorObservations,
+    PositionTransactionRead,
     TimeframeAlignment,
     TradeReviewIndicatorSnapshotInput,
     TradeReviewInput,
     TradeReviewOutput,
     TradeReviewPositionInput,
     TradeReviewResponse,
-    UserTradingRules,
 )
+from app.services.position_context import PositionContextService
+from app.services.trading_plan_service import TradingPlanService
 
 REQUIRED_REVIEW_TIMEFRAMES = ("Min60", "Hour4", "Day1")
 TIMEFRAME_OUTPUT_KEYS = {
@@ -65,6 +69,10 @@ class PositionNotFoundError(ValueError):
     pass
 
 
+class OpenAiNotConfiguredError(TradeReviewError):
+    pass
+
+
 class AiReviewEngine:
     """Generates structured educational trade reviews without trading instructions."""
 
@@ -83,23 +91,22 @@ class AiReviewEngine:
     async def generate_review(
         self,
         position_id: UUID,
-        user_rules: UserTradingRules | None = None,
         similar_past_trade_stats: dict[str, Any] | None = None,
     ) -> TradeReviewResponse:
         position = self._get_position(position_id)
         if position is None:
             raise PositionNotFoundError(f"Position not found: {position_id}")
 
-        snapshots = self._load_required_snapshots(position_id)
-        review_input = self._build_review_input(
+        review_input = self._build_review_context(
             position=position,
-            snapshots=snapshots,
-            user_rules=user_rules,
             similar_past_trade_stats=similar_past_trade_stats,
         )
+        entry_snapshots = self._entry_snapshots_by_timeframe(review_input.indicator_snapshots)
 
         missing_timeframes = [
-            timeframe for timeframe in REQUIRED_REVIEW_TIMEFRAMES if timeframe not in snapshots
+            timeframe
+            for timeframe in REQUIRED_REVIEW_TIMEFRAMES
+            if timeframe not in entry_snapshots
         ]
         if missing_timeframes or not self.openai_api_key:
             review = self._fallback_review(
@@ -122,16 +129,91 @@ class AiReviewEngine:
             review=review,
         )
 
+    def list_questions(self, position_id: UUID) -> list[AiTradeQuestionRead]:
+        position = self._get_position(position_id)
+        if position is None:
+            raise PositionNotFoundError(f"Position not found: {position_id}")
+
+        if not hasattr(self.db, "scalars"):
+            questions = [
+                question
+                for question in getattr(self.db, "questions", [])
+                if question.position_id == position_id
+            ]
+            return [
+                AiTradeQuestionRead.model_validate(row)
+                for row in sorted(
+                    questions,
+                    key=lambda question: question.created_at,
+                    reverse=True,
+                )
+            ]
+
+        statement = (
+            select(AiTradeQuestion)
+            .where(AiTradeQuestion.position_id == position_id)
+            .order_by(AiTradeQuestion.created_at.desc())
+        )
+        return [AiTradeQuestionRead.model_validate(row) for row in self.db.scalars(statement).all()]
+
+    async def answer_question(self, position_id: UUID, question: str) -> AiTradeQuestionRead:
+        position = self._get_position(position_id)
+        if position is None:
+            raise PositionNotFoundError(f"Position not found: {position_id}")
+        if not self.openai_api_key:
+            raise OpenAiNotConfiguredError("OpenAI API key is missing.")
+
+        context = self._build_question_context(position=position)
+        answer = await self._request_question_answer(question=question, context=context)
+        if self.contains_forbidden_phrase(answer):
+            answer = (
+                "I cannot provide trading instructions. Based on the stored retrospective "
+                "context, review the transaction timing, plan compliance, and documented "
+                "risk flags before making your own decision."
+            )
+
+        row = AiTradeQuestion(
+            user_id=position.user_id,
+            position_id=position.id,
+            question=question.strip(),
+            answer=answer.strip(),
+            context_json=context,
+            model=self.model,
+            created_at=utc_now(),
+        )
+        self.db.add(row)
+        self.db.commit()
+        if hasattr(self.db, "refresh"):
+            self.db.refresh(row)
+        return AiTradeQuestionRead.model_validate(row)
+
     def _get_position(self, position_id: UUID) -> FuturesPosition | None:
         return self.db.get(FuturesPosition, position_id)
 
-    def _load_required_snapshots(self, position_id: UUID) -> dict[str, IndicatorSnapshot]:
+    def _load_required_snapshots(self, position_id: UUID) -> list[IndicatorSnapshot]:
         statement = (
             select(IndicatorSnapshot)
             .where(IndicatorSnapshot.position_id == position_id)
             .where(IndicatorSnapshot.timeframe.in_(REQUIRED_REVIEW_TIMEFRAMES))
         )
-        return {snapshot.timeframe: snapshot for snapshot in self.db.scalars(statement).all()}
+        return list(self.db.scalars(statement).all())
+
+    def _load_user_positions(self, user_id: UUID) -> list[FuturesPosition]:
+        if not hasattr(self.db, "scalars"):
+            positions = getattr(self.db, "positions", [])
+            if isinstance(positions, dict):
+                return [
+                    position
+                    for position in positions.values()
+                    if getattr(position, "user_id", None) == user_id
+                ]
+            return [
+                position
+                for position in positions
+                if getattr(position, "user_id", None) == user_id
+            ]
+        statement = select(FuturesPosition).where(FuturesPosition.user_id == user_id)
+        return list(self.db.scalars(statement).all())
 
     def _save_review(self, position: FuturesPosition, review: TradeReviewOutput) -> AiTradeReview:
         review_row = AiTradeReview(
@@ -151,11 +233,46 @@ class AiReviewEngine:
             self.db.refresh(review_row)
         return review_row
 
+    def _build_review_context(
+        self,
+        position: FuturesPosition,
+        similar_past_trade_stats: dict[str, Any] | None,
+    ) -> TradeReviewInput:
+        raw_snapshots = self._load_required_snapshots(position.id)
+        snapshots = (
+            list(raw_snapshots.values())
+            if isinstance(raw_snapshots, dict)
+            else list(raw_snapshots)
+        )
+        transaction_timeline, transaction_timeline_source = PositionContextService(
+            db=self.db
+        ).transaction_timeline(position)
+        plan_service = TradingPlanService(db=self.db)
+        trading_plan = plan_service.load_active_plan(user_id=position.user_id)
+        plan_evaluation = plan_service.evaluate_position(
+            plan=trading_plan,
+            position=position,
+            snapshots=snapshots,
+            positions_for_daily_count=self._load_user_positions(position.user_id),
+        )
+        return self._build_review_input(
+            position=position,
+            snapshots=snapshots,
+            transaction_timeline=transaction_timeline,
+            transaction_timeline_source=transaction_timeline_source,
+            trading_plan=plan_service.to_review_context(trading_plan),
+            plan_evaluation=plan_evaluation,
+            similar_past_trade_stats=similar_past_trade_stats,
+        )
+
     def _build_review_input(
         self,
         position: FuturesPosition,
-        snapshots: dict[str, IndicatorSnapshot],
-        user_rules: UserTradingRules | None,
+        snapshots: list[IndicatorSnapshot],
+        transaction_timeline: list[PositionTransactionRead],
+        transaction_timeline_source: str,
+        trading_plan,
+        plan_evaluation,
         similar_past_trade_stats: dict[str, Any] | None,
     ) -> TradeReviewInput:
         return TradeReviewInput(
@@ -172,10 +289,22 @@ class AiReviewEngine:
             ),
             indicator_snapshots=[
                 self._snapshot_to_input(snapshot)
-                for timeframe, snapshot in sorted(snapshots.items())
-                if timeframe in REQUIRED_REVIEW_TIMEFRAMES
+                for snapshot in sorted(
+                    snapshots,
+                    key=lambda snapshot: (
+                        getattr(snapshot, "anchor", "entry"),
+                        REQUIRED_REVIEW_TIMEFRAMES.index(snapshot.timeframe)
+                        if snapshot.timeframe in REQUIRED_REVIEW_TIMEFRAMES
+                        else 99,
+                    ),
+                )
+                if snapshot.timeframe in REQUIRED_REVIEW_TIMEFRAMES
             ],
-            user_rules=user_rules,
+            transaction_timeline=transaction_timeline,
+            transaction_timeline_source=transaction_timeline_source,
+            trading_plan=trading_plan,
+            plan_evaluation=plan_evaluation,
+            user_rules=None,
             similar_past_trade_stats=self._sanitize_payload(similar_past_trade_stats),
         )
 
@@ -185,6 +314,7 @@ class AiReviewEngine:
     ) -> TradeReviewIndicatorSnapshotInput:
         return TradeReviewIndicatorSnapshotInput(
             timeframe=snapshot.timeframe,
+            anchor=getattr(snapshot, "anchor", None) or "entry",
             rsi_14=snapshot.rsi_14,
             stoch_rsi_k=snapshot.stoch_rsi_k,
             stoch_rsi_d=snapshot.stoch_rsi_d,
@@ -197,6 +327,38 @@ class AiReviewEngine:
             volume_relative=snapshot.volume_relative,
             trend_label=snapshot.trend_label,
         )
+
+    def _build_question_context(self, position: FuturesPosition) -> dict[str, Any]:
+        review_input = self._build_review_context(
+            position=position,
+            similar_past_trade_stats=None,
+        )
+        latest_review = self._load_latest_review(position_id=position.id)
+        context = review_input.model_dump(mode="json")
+        context["latest_review"] = (
+            latest_review.review_json if latest_review is not None else None
+        )
+        return self._sanitize_payload(context)
+
+    def _load_latest_review(self, position_id: UUID) -> AiTradeReview | None:
+        if not hasattr(self.db, "scalar"):
+            reviews = [
+                review
+                for review in getattr(self.db, "reviews", [])
+                if review.position_id == position_id
+            ]
+            return (
+                sorted(reviews, key=lambda review: review.created_at, reverse=True)[0]
+                if reviews
+                else None
+            )
+        statement = (
+            select(AiTradeReview)
+            .where(AiTradeReview.position_id == position_id)
+            .order_by(AiTradeReview.created_at.desc())
+            .limit(1)
+        )
+        return self.db.scalar(statement)
 
     async def _generate_llm_review_or_fallback(
         self,
@@ -237,6 +399,20 @@ class AiReviewEngine:
             response.raise_for_status()
         return self._extract_structured_output(response.json())
 
+    async def _request_question_answer(self, question: str, context: dict[str, Any]) -> str:
+        payload = self._build_question_payload(question=question, context=context)
+        async with httpx.AsyncClient(base_url=self.openai_base_url, timeout=30.0) as client:
+            response = await client.post(
+                "/responses",
+                headers={
+                    "Authorization": f"Bearer {self.openai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+        return self._extract_text_output(response.json())
+
     def _build_openai_payload(
         self,
         review_input: TradeReviewInput,
@@ -245,8 +421,9 @@ class AiReviewEngine:
         sanitized_input = self._sanitize_payload(review_input.model_dump(mode="json"))
         system_prompt = (
             "You are an educational trade-review assistant for completed MEXC Futures "
-            "positions. You are not a signal bot. Review only the past trade and user "
-            "rules. Do not instruct the user to buy, sell, short, long, or enter. "
+            "positions. You are not a signal bot. Ground the review in the stored "
+            "transaction timestamps, entry/exit indicator snapshots, and user rules. "
+            "Do not instruct the user to buy, sell, short, long, or enter. "
             "Never claim guarantees. The final decision belongs to the user."
         )
         if strict_retry:
@@ -283,6 +460,44 @@ class AiReviewEngine:
             "temperature": 0.2,
         }
 
+    def _build_question_payload(self, question: str, context: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "input": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "You answer retrospective questions about completed or "
+                                "reconstructed MEXC Futures positions. Use only the provided "
+                                "transaction timeline, position data, indicator snapshots, AI "
+                                "review, and trading plan. Do not give direct trading "
+                                "instructions or financial advice."
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": json.dumps(
+                                {
+                                    "question": question,
+                                    "context": context,
+                                },
+                                sort_keys=True,
+                            ),
+                        }
+                    ],
+                },
+            ],
+            "temperature": 0.2,
+        }
+
     def _extract_structured_output(self, payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(payload.get("output_text"), str):
             return json.loads(payload["output_text"])
@@ -294,13 +509,34 @@ class AiReviewEngine:
                     return json.loads(text)
         raise ValueError("OpenAI response did not include structured text output.")
 
+    def _extract_text_output(self, payload: dict[str, Any]) -> str:
+        if isinstance(payload.get("output_text"), str):
+            return payload["output_text"]
+
+        fragments: list[str] = []
+        for output_item in payload.get("output", []):
+            for content_item in output_item.get("content", []):
+                text = content_item.get("text")
+                if isinstance(text, str):
+                    fragments.append(text)
+        answer = "\n".join(fragments).strip()
+        if answer:
+            return answer
+        raise ValueError("OpenAI response did not include text output.")
+
     def _fallback_review(
         self,
         review_input: TradeReviewInput,
         missing_timeframes: list[str],
     ) -> TradeReviewOutput:
+        entry_snapshots = [
+            snapshot
+            for snapshot in review_input.indicator_snapshots
+            if snapshot.anchor == "entry"
+        ]
         snapshot_by_timeframe = {
             snapshot.timeframe: snapshot for snapshot in review_input.indicator_snapshots
+            if snapshot.anchor == "entry"
         }
         timeframe_alignment = self._fallback_timeframe_alignment(snapshot_by_timeframe)
         observations = self._fallback_indicator_observations(snapshot_by_timeframe)
@@ -336,6 +572,23 @@ class AiReviewEngine:
                 "Final decision belongs to the user. "
                 "This review is educational and retrospective."
             ),
+            transaction_timeline=self._fallback_transaction_timeline(review_input),
+            entry_analysis=self._fallback_anchor_analysis(entry_snapshots, "entry"),
+            exit_analysis=self._fallback_anchor_analysis(
+                [
+                    snapshot
+                    for snapshot in review_input.indicator_snapshots
+                    if snapshot.anchor == "exit"
+                ],
+                "exit",
+            ),
+            plan_compliance=self._fallback_plan_compliance(review_input),
+            execution_notes=self._fallback_execution_notes(review_input),
+            missed_context=risk_flags or ["No deterministic missed context was identified."],
+            follow_up_questions=[
+                "Which plan item was hardest to satisfy for this position?",
+                "How did transaction timing compare with the stored indicator context?",
+            ],
         )
 
     def _fallback_timeframe_alignment(
@@ -465,7 +718,75 @@ class AiReviewEngine:
             tags.append("momentum_extreme_at_entry")
         return tags
 
+    def _fallback_transaction_timeline(self, review_input: TradeReviewInput) -> list[str]:
+        if not review_input.transaction_timeline:
+            return ["No stored transaction timeline was available for this position."]
+        return [
+            (
+                f"{transaction.timestamp.isoformat()}: {transaction.side_label} "
+                f"{transaction.vol} {review_input.position.symbol} at {transaction.price} "
+                f"(fee {transaction.fee}, realized PnL {transaction.profit})."
+            )
+            for transaction in review_input.transaction_timeline
+        ]
+
+    def _fallback_anchor_analysis(
+        self,
+        snapshots: list[TradeReviewIndicatorSnapshotInput],
+        anchor: str,
+    ) -> list[str]:
+        if not snapshots:
+            return [f"No {anchor} indicator snapshots were available."]
+        return [
+            (
+                f"{TIMEFRAME_LABELS.get(snapshot.timeframe, snapshot.timeframe)} {anchor}: "
+                f"trend {snapshot.trend_label or 'unknown'}, "
+                f"RSI {snapshot.rsi_14 if snapshot.rsi_14 is not None else 'unavailable'}, "
+                f"Supertrend {snapshot.supertrend_direction or 'unavailable'}."
+            )
+            for snapshot in snapshots
+        ]
+
+    def _fallback_plan_compliance(self, review_input: TradeReviewInput) -> list[str]:
+        evaluation = review_input.plan_evaluation
+        if evaluation is None or not evaluation.items:
+            return ["No enabled trading plan items were available for this review."]
+        return [
+            f"{item.title}: {item.status} - {item.message}"
+            for item in evaluation.items
+        ]
+
+    def _fallback_execution_notes(self, review_input: TradeReviewInput) -> list[str]:
+        notes = [
+            (
+                f"Position opened at {review_input.position.opened_at.isoformat()} "
+                f"and status is {review_input.position.status}."
+            )
+        ]
+        if review_input.position.closed_at is not None:
+            notes.append(f"Position closed at {review_input.position.closed_at.isoformat()}.")
+        if review_input.transaction_timeline_source == "inferred":
+            notes.append(
+                "Transaction timeline was inferred from raw fills and may include overlap."
+            )
+        elif review_input.transaction_timeline_source == "linked":
+            notes.append("Transaction timeline is linked to the reconstructed position.")
+        return notes
+
+    def _entry_snapshots_by_timeframe(
+        self,
+        snapshots: list[TradeReviewIndicatorSnapshotInput],
+    ) -> dict[str, TradeReviewIndicatorSnapshotInput]:
+        return {
+            snapshot.timeframe: snapshot
+            for snapshot in snapshots
+            if snapshot.anchor == "entry"
+        }
+
     def _rule_match_score(self, review_input: TradeReviewInput) -> int | None:
+        if review_input.plan_evaluation is not None:
+            return review_input.plan_evaluation.score
+
         rules = review_input.user_rules
         if rules is None:
             return None

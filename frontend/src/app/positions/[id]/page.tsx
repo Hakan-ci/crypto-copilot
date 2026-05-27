@@ -6,11 +6,14 @@ import { useParams } from "next/navigation";
 import { useMemo, useState } from "react";
 
 import { CandlestickChart, type ChartCandle } from "@/components/CandlestickChart";
+import { AiQuestionPanel } from "@/components/AiQuestionPanel";
 import { EmptyState } from "@/components/EmptyState";
 import { IndicatorSnapshotPanel } from "@/components/IndicatorSnapshotPanel";
 import { MetricCard } from "@/components/MetricCard";
 import { RiskWarnings } from "@/components/RiskWarnings";
 import { TimeframeSelector } from "@/components/TimeframeSelector";
+import { TradingPlanEvaluationPanel } from "@/components/TradingPlanEvaluationPanel";
+import { TransactionTimelinePanel } from "@/components/TransactionTimelinePanel";
 import { TradeReviewPanel } from "@/components/TradeReviewPanel";
 import { calculateIndicatorSnapshots, getPositionDetail, listPositionCandles } from "@/lib/api";
 import { classForPnl, formatCurrency, formatDateTime, formatDecimal } from "@/lib/format";
@@ -164,6 +167,13 @@ export default function PositionDetailPage() {
 
       <RiskWarnings position={position} snapshots={snapshots} />
 
+      <TransactionTimelinePanel
+        transactions={detail.transaction_timeline}
+        source={detail.transaction_timeline_source}
+      />
+
+      <TradingPlanEvaluationPanel evaluation={detail.plan_evaluation} />
+
       <section className="space-y-3">
         <div className="flex items-center justify-between gap-3">
           <h2 className="text-lg font-semibold text-slate-950">Indicator snapshots</h2>
@@ -191,6 +201,8 @@ export default function PositionDetailPage() {
         review={detail.ai_review}
         snapshotsReady={snapshotsReady}
       />
+
+      <AiQuestionPanel positionId={position.id} />
     </div>
   );
 }

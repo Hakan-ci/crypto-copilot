@@ -8,12 +8,22 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import ValidationError
 
-from app.db.models import AiTradeReview, FuturesPosition, IndicatorSnapshot
+from app.db.models import (
+    AiTradeQuestion,
+    AiTradeReview,
+    FuturesPosition,
+    IndicatorSnapshot,
+    RawMexcOrderDeal,
+)
 from app.schemas.trades import (
     IndicatorObservations,
     TimeframeAlignment,
     TradeReviewOutput,
-    UserTradingRules,
+)
+from app.schemas.trading_plan import (
+    TradingPlanEvaluation,
+    TradingPlanReviewContext,
+    TradingPlanReviewItem,
 )
 from app.services.ai_review_engine import FORBIDDEN_AI_PHRASES, AiReviewEngine
 
@@ -23,6 +33,8 @@ class FakeDbSession:
         self.positions: dict[UUID, FuturesPosition] = {}
         self.snapshots: list[IndicatorSnapshot] = []
         self.reviews: list[AiTradeReview] = []
+        self.raw_deals: list[RawMexcOrderDeal] = []
+        self.questions: list[AiTradeQuestion] = []
         self.committed = False
 
     def get(self, model: type, object_id: UUID) -> FuturesPosition | None:
@@ -32,6 +44,8 @@ class FakeDbSession:
     def add(self, row: Any) -> None:
         if isinstance(row, AiTradeReview):
             self.reviews.append(row)
+        elif isinstance(row, AiTradeQuestion):
+            self.questions.append(row)
 
     def commit(self) -> None:
         self.committed = True
@@ -47,17 +61,20 @@ class AiReviewEngineForTest(AiReviewEngine):
         db: FakeDbSession,
         openai_api_key: str | None = None,
         llm_responses: list[dict[str, Any]] | None = None,
+        question_responses: list[str] | None = None,
     ) -> None:
         super().__init__(db=db, openai_api_key=openai_api_key, model="gpt-4o-mini")
         self.llm_responses = llm_responses or []
+        self.question_responses = question_responses or []
         self.prompt_payloads: list[dict[str, Any]] = []
+        self.question_payloads: list[dict[str, Any]] = []
 
-    def _load_required_snapshots(self, position_id: UUID) -> dict[str, IndicatorSnapshot]:
-        return {
-            snapshot.timeframe: snapshot
+    def _load_required_snapshots(self, position_id: UUID) -> list[IndicatorSnapshot]:
+        return [
+            snapshot
             for snapshot in self.db.snapshots
             if snapshot.position_id == position_id
-        }
+        ]
 
     async def _request_llm_review(
         self,
@@ -70,6 +87,12 @@ class AiReviewEngineForTest(AiReviewEngine):
         if not self.llm_responses:
             raise AssertionError("No fake LLM response configured.")
         return self.llm_responses.pop(0)
+
+    async def _request_question_answer(self, question: str, context: dict[str, Any]) -> str:
+        self.question_payloads.append({"question": question, "context": context})
+        if not self.question_responses:
+            raise AssertionError("No fake question response configured.")
+        return self.question_responses.pop(0)
 
 
 def make_position(position_id: UUID) -> FuturesPosition:
@@ -114,6 +137,32 @@ def make_snapshot(
         atr_14=Decimal("3.5"),
         volume_relative=Decimal("1.2"),
         trend_label=trend_label,
+    )
+
+
+def make_raw_deal(
+    position: FuturesPosition,
+    deal_id: str,
+    side: int,
+    timestamp_ms: int,
+) -> RawMexcOrderDeal:
+    return RawMexcOrderDeal(
+        id=uuid4(),
+        user_id=position.user_id,
+        mexc_deal_id=deal_id,
+        symbol=position.symbol,
+        side=side,
+        vol=Decimal("1"),
+        price=Decimal("100") if side in {1, 3} else Decimal("110"),
+        fee=Decimal("0.10"),
+        fee_currency="USDT",
+        profit=Decimal("0") if side in {1, 3} else Decimal("10"),
+        category=None,
+        order_id=f"order-{deal_id}",
+        timestamp_ms=timestamp_ms,
+        position_mode=None,
+        taker=None,
+        raw_json={"id": deal_id, "timestamp": timestamp_ms},
     )
 
 
@@ -246,7 +295,6 @@ def test_raw_api_secrets_are_never_included_in_prompt_input():
     asyncio.run(
         engine.generate_review(
             position_id=position_id,
-            user_rules=UserTradingRules(notes="follow checklist"),
             similar_past_trade_stats={
                 "wins": 2,
                 "api_key": "MEXC-SECRET-KEY",
@@ -260,6 +308,120 @@ def test_raw_api_secrets_are_never_included_in_prompt_input():
     assert "MEXC-SECRET-KEY" not in prompt_text
     assert "OPENAI-SECRET" not in prompt_text
     assert "RAW-CREDENTIAL" not in prompt_text
+
+
+def test_backend_trading_plan_context_is_included_in_prompt(monkeypatch):
+    db, position_id = make_db()
+    engine = AiReviewEngineForTest(
+        db=db,
+        openai_api_key="test-openai-key",
+        llm_responses=[valid_review_dict()],
+    )
+    plan_context = TradingPlanReviewContext(
+        items=[
+            TradingPlanReviewItem(
+                title="Only trade major pairs",
+                description=None,
+                category="Setup",
+                rule_type="allowed_symbols",
+                enabled=True,
+                config={"symbols": ["BTC_USDT"]},
+                sort_order=0,
+            )
+        ]
+    )
+    plan_evaluation = TradingPlanEvaluation(
+        score=100,
+        passed_items_count=1,
+        failed_items_count=0,
+        unknown_items_count=0,
+        manual_items_count=0,
+        total_scored_items=1,
+        items=[],
+    )
+
+    monkeypatch.setattr(
+        "app.services.trading_plan_service.TradingPlanService.load_active_plan",
+        lambda self, user_id: object(),
+    )
+    monkeypatch.setattr(
+        "app.services.trading_plan_service.TradingPlanService.to_review_context",
+        lambda self, plan: plan_context,
+    )
+    monkeypatch.setattr(
+        "app.services.trading_plan_service.TradingPlanService.evaluate_position",
+        lambda self, plan, position, snapshots, positions_for_daily_count: plan_evaluation,
+    )
+
+    asyncio.run(engine.generate_review(position_id=position_id))
+
+    prompt_text = json.dumps(engine.prompt_payloads)
+    assert "Only trade major pairs" in prompt_text
+    assert "allowed_symbols" in prompt_text
+
+
+def test_review_prompt_includes_transaction_timeline():
+    db, position_id = make_db()
+    position = db.positions[position_id]
+    db.raw_deals = [
+        make_raw_deal(position, "entry-1", side=1, timestamp_ms=1_710_000_000_000),
+        make_raw_deal(position, "exit-1", side=4, timestamp_ms=1_710_003_600_000),
+    ]
+    engine = AiReviewEngineForTest(
+        db=db,
+        openai_api_key="test-openai-key",
+        llm_responses=[valid_review_dict()],
+    )
+
+    asyncio.run(engine.generate_review(position_id=position_id))
+
+    prompt_text = json.dumps(engine.prompt_payloads)
+    assert "entry-1" in prompt_text
+    assert "exit-1" in prompt_text
+    assert "transaction_timeline" in prompt_text
+
+
+def test_fallback_review_populates_expanded_sections():
+    db, position_id = make_db()
+    position = db.positions[position_id]
+    db.raw_deals = [make_raw_deal(position, "entry-1", side=1, timestamp_ms=1_710_000_000_000)]
+    engine = AiReviewEngineForTest(db=db, openai_api_key=None)
+
+    response = asyncio.run(engine.generate_review(position_id=position_id))
+
+    assert response.review.transaction_timeline
+    assert response.review.entry_analysis
+    assert response.review.plan_compliance
+    assert response.review.execution_notes
+    assert response.review.follow_up_questions
+
+
+def test_ai_question_answer_is_saved_with_context():
+    db, position_id = make_db()
+    position = db.positions[position_id]
+    db.raw_deals = [make_raw_deal(position, "entry-1", side=1, timestamp_ms=1_710_000_000_000)]
+    engine = AiReviewEngineForTest(
+        db=db,
+        openai_api_key="test-openai-key",
+        question_responses=["The stored entry fill happened at the reviewed transaction time."],
+    )
+
+    question = asyncio.run(
+        engine.answer_question(position_id=position_id, question="How was the timing?")
+    )
+
+    assert question.answer.startswith("The stored entry fill")
+    assert len(db.questions) == 1
+    assert db.questions[0].context_json["transaction_timeline"]
+    assert engine.list_questions(position_id=position_id)[0].id == question.id
+
+
+def test_ai_question_requires_openai_key():
+    db, position_id = make_db()
+    engine = AiReviewEngineForTest(db=db, openai_api_key=None)
+
+    with pytest.raises(Exception, match="OpenAI API key is missing"):
+        asyncio.run(engine.answer_question(position_id=position_id, question="What happened?"))
 
 
 def test_forbidden_llm_output_falls_back_to_safe_review():

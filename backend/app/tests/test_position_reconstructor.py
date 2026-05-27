@@ -4,7 +4,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from app.core.time import datetime_from_ms
-from app.db.models import FuturesPosition, RawMexcOrderDeal
+from app.db.models import FuturesPosition, FuturesPositionDeal, RawMexcOrderDeal
 from app.services.position_reconstructor import (
     RAW_SOURCE_MEXC_ORDER_DEALS_V3,
     PositionReconstructor,
@@ -28,6 +28,7 @@ class FakeDbSession:
     def __init__(self) -> None:
         self.raw_deals: list[RawMexcOrderDeal] = []
         self.positions: list[FuturesPosition] = []
+        self.position_deals: list[FuturesPositionDeal] = []
         self.transaction_started = False
         self.transaction_exited = False
 
@@ -35,7 +36,15 @@ class FakeDbSession:
         return FakeTransaction(self)
 
     def add(self, row: Any) -> None:
-        self.positions.append(row)
+        if isinstance(row, FuturesPosition):
+            self.positions.append(row)
+        elif isinstance(row, FuturesPositionDeal):
+            self.position_deals.append(row)
+
+    def flush(self) -> None:
+        for position in self.positions:
+            if getattr(position, "id", None) is None:
+                position.id = uuid4()
 
 
 class ReconstructorForTest(PositionReconstructor):
@@ -70,6 +79,7 @@ def make_raw_deal(
     symbol: str = "BTC_USDT",
 ) -> RawMexcOrderDeal:
     return RawMexcOrderDeal(
+        id=uuid4(),
         user_id=user_id,
         mexc_deal_id=deal_id,
         symbol=symbol,
@@ -134,6 +144,11 @@ def test_single_long_open_close_creates_closed_position():
     assert position.realized_pnl == Decimal("10")
     assert position.opened_at == datetime_from_ms(1000)
     assert position.closed_at == datetime_from_ms(2000)
+    assert [link.raw_mexc_order_deal_id for link in db.position_deals] == [
+        db.raw_deals[0].id,
+        db.raw_deals[1].id,
+    ]
+    assert [link.sort_order for link in db.position_deals] == [0, 1]
 
 
 def test_partial_long_entries_update_weighted_average_entry():

@@ -1,5 +1,9 @@
 import type {
   Candle,
+  AiTradeQuestion,
+  CryptoBasket,
+  CryptoBasketSyncResponse,
+  CryptoBasketUpsert,
   DashboardMetrics,
   ImportAndReconstructResponse,
   ImportOrderDealsRequest,
@@ -10,8 +14,9 @@ import type {
   PositionDetail,
   PositionFilters,
   Timeframe,
+  TradingPlan,
+  TradingPlanUpsert,
   TradeReviewResponse,
-  UserTradingRules
 } from "@/lib/types";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
@@ -83,6 +88,35 @@ export function getPositionDetail(positionId: string) {
   return request<PositionDetail>(`/positions/${positionId}`);
 }
 
+export function getTradingPlan(userId: string) {
+  return request<TradingPlan>(`/users/${userId}/trading-plan`);
+}
+
+export function putTradingPlan(userId: string, payload: TradingPlanUpsert) {
+  return request<TradingPlan>(`/users/${userId}/trading-plan`, {
+    method: "PUT",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function getCryptoBasket(userId: string) {
+  return request<CryptoBasket>(`/users/${userId}/crypto-basket`);
+}
+
+export function putCryptoBasket(userId: string, payload: CryptoBasketUpsert) {
+  return request<CryptoBasket>(`/users/${userId}/crypto-basket`, {
+    method: "PUT",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function syncCryptoBasket(userId: string) {
+  return request<CryptoBasketSyncResponse>(`/users/${userId}/crypto-basket/sync`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+}
+
 export function getMexcReadiness(symbol = "BTC_USDT") {
   return request<MexcReadinessResponse>(`/mexc/readiness${toQueryString({ symbol })}`);
 }
@@ -115,11 +149,20 @@ export function calculateIndicatorSnapshots(positionId: string, timeframes: Time
   );
 }
 
-export function generateReview(positionId: string, userRules?: UserTradingRules) {
+export function generateReview(positionId: string) {
   return request<TradeReviewResponse>(`/positions/${positionId}/review`, {
     method: "POST",
-    body: JSON.stringify({
-      user_rules: userRules && Object.keys(userRules).length > 0 ? userRules : null
-    })
+    body: JSON.stringify({})
+  });
+}
+
+export function listAiQuestions(positionId: string) {
+  return request<AiTradeQuestion[]>(`/positions/${positionId}/ai-questions`);
+}
+
+export function askAiQuestion(positionId: string, question: string) {
+  return request<AiTradeQuestion>(`/positions/${positionId}/ai-questions`, {
+    method: "POST",
+    body: JSON.stringify({ question })
   });
 }

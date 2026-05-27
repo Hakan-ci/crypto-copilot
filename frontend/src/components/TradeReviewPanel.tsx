@@ -4,7 +4,6 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Sparkles } from "lucide-react";
 
 import { generateReview } from "@/lib/api";
-import { loadTradingPlan } from "@/lib/storage";
 import type { AiTradeReview, TradeReviewOutput } from "@/lib/types";
 
 function readReview(review: AiTradeReview | null): TradeReviewOutput | null {
@@ -36,7 +35,14 @@ function readReview(review: AiTradeReview | null): TradeReviewOutput | null {
     rule_match_score: review.rule_match_score,
     risk_score: review.risk_score,
     execution_score: review.execution_score,
-    final_note: "Final decision belongs to the user."
+    final_note: "Final decision belongs to the user.",
+    transaction_timeline: [],
+    entry_analysis: [],
+    exit_analysis: [],
+    plan_compliance: [],
+    execution_notes: [],
+    missed_context: [],
+    follow_up_questions: []
   };
 }
 
@@ -51,7 +57,7 @@ export function TradeReviewPanel({
 }) {
   const queryClient = useQueryClient();
   const mutation = useMutation({
-    mutationFn: () => generateReview(positionId, loadTradingPlan()),
+    mutationFn: () => generateReview(positionId),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["position-detail", positionId] });
     }
@@ -108,6 +114,21 @@ export function TradeReviewPanel({
             <ReviewList title="Risk flags" items={reviewOutput.risk_flags} />
             <ReviewList title="Mistake tags" items={reviewOutput.mistake_tags} />
           </div>
+          <div className="grid gap-4 lg:grid-cols-2">
+            <ReviewList
+              title="Transaction timing"
+              items={reviewOutput.transaction_timeline ?? []}
+            />
+            <ReviewList title="Plan compliance" items={reviewOutput.plan_compliance ?? []} />
+            <ReviewList title="Entry analysis" items={reviewOutput.entry_analysis ?? []} />
+            <ReviewList title="Exit analysis" items={reviewOutput.exit_analysis ?? []} />
+            <ReviewList title="Execution notes" items={reviewOutput.execution_notes ?? []} />
+            <ReviewList title="Missed context" items={reviewOutput.missed_context ?? []} />
+          </div>
+          <ReviewList
+            title="Follow-up questions"
+            items={reviewOutput.follow_up_questions ?? []}
+          />
           <p className="rounded-md bg-stone-50 px-3 py-2 text-sm text-slate-700">
             {reviewOutput.final_note}
           </p>

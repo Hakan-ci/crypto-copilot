@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
@@ -13,7 +13,7 @@ from app.core.constants import (
     MEXC_SIDE_OPEN_SHORT,
 )
 from app.core.time import datetime_from_ms
-from app.db.models import FuturesPosition, RawMexcOrderDeal
+from app.db.models import FuturesPosition, FuturesPositionDeal, RawMexcOrderDeal
 from app.schemas.trades import ReconstructionReport
 
 RAW_SOURCE_MEXC_ORDER_DEALS_V3 = "mexc_order_deals_v3"
@@ -35,8 +35,15 @@ class PositionLedger:
     funding_fees: Decimal = ZERO
     closed_volume: Decimal = ZERO
     avg_exit_price: Decimal | None = None
+    raw_deal_ids: list[UUID] = field(default_factory=list)
 
-    def add_entry(self, volume: Decimal, price: Decimal, fee: Decimal) -> None:
+    def add_entry(
+        self,
+        volume: Decimal,
+        price: Decimal,
+        fee: Decimal,
+        raw_deal_id: UUID | None,
+    ) -> None:
         new_total_volume = self.total_volume + volume
         self.avg_entry_price = (
             (self.avg_entry_price * self.total_volume) + (price * volume)
@@ -44,8 +51,17 @@ class PositionLedger:
         self.total_volume = new_total_volume
         self.open_volume += volume
         self.total_fees += abs(fee)
+        if raw_deal_id is not None:
+            self.raw_deal_ids.append(raw_deal_id)
 
-    def add_exit(self, volume: Decimal, price: Decimal, fee: Decimal, profit: Decimal) -> None:
+    def add_exit(
+        self,
+        volume: Decimal,
+        price: Decimal,
+        fee: Decimal,
+        profit: Decimal,
+        raw_deal_id: UUID | None,
+    ) -> None:
         new_closed_volume = self.closed_volume + volume
         if self.avg_exit_price is None:
             self.avg_exit_price = price
@@ -60,9 +76,11 @@ class PositionLedger:
             self.open_volume = ZERO
         self.total_fees += abs(fee)
         self.realized_pnl += profit
+        if raw_deal_id is not None:
+            self.raw_deal_ids.append(raw_deal_id)
 
     def to_model(self, status: str, closed_at: datetime | None = None) -> FuturesPosition:
-        return FuturesPosition(
+        position = FuturesPosition(
             user_id=self.user_id,
             exchange=MEXC_EXCHANGE,
             symbol=self.symbol,
@@ -79,6 +97,8 @@ class PositionLedger:
             status=status,
             raw_source=RAW_SOURCE_MEXC_ORDER_DEALS_V3,
         )
+        position._raw_deal_ids = list(self.raw_deal_ids)
+        return position
 
 
 class PositionReconstructor:
@@ -130,6 +150,21 @@ class PositionReconstructor:
 
     def _save_position(self, position: FuturesPosition) -> None:
         self.db.add(position)
+        raw_deal_ids = getattr(position, "_raw_deal_ids", [])
+        if not raw_deal_ids:
+            return
+        if hasattr(self.db, "flush"):
+            self.db.flush()
+        if position.id is None:
+            return
+        for sort_order, raw_deal_id in enumerate(raw_deal_ids):
+            self.db.add(
+                FuturesPositionDeal(
+                    position_id=position.id,
+                    raw_mexc_order_deal_id=raw_deal_id,
+                    sort_order=sort_order,
+                )
+            )
 
     def _reconstruct_positions(
         self,
@@ -214,9 +249,15 @@ class PositionReconstructor:
                 total_volume=volume,
                 open_volume=volume,
                 total_fees=abs(fee),
+                raw_deal_ids=[deal.id] if getattr(deal, "id", None) is not None else [],
             )
 
-        ledger.add_entry(volume=volume, price=price, fee=fee)
+        ledger.add_entry(
+            volume=volume,
+            price=price,
+            fee=fee,
+            raw_deal_id=getattr(deal, "id", None),
+        )
         return ledger
 
     def _handle_exit(
@@ -251,6 +292,7 @@ class PositionReconstructor:
             price=self._decimal(deal.price),
             fee=self._decimal(deal.fee),
             profit=self._decimal_or_zero(getattr(deal, "profit", None)),
+            raw_deal_id=getattr(deal, "id", None),
         )
 
         if ledger.open_volume == ZERO:

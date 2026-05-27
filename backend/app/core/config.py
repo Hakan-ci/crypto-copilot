@@ -22,6 +22,20 @@ class Settings(BaseSettings):
     openai_review_model: str = Field(default="gpt-4o-mini", alias="OPENAI_REVIEW_MODEL")
     mexc_access_key: SecretStr | None = Field(default=None, alias="MEXC_ACCESS_KEY")
     mexc_secret_key: SecretStr | None = Field(default=None, alias="MEXC_SECRET_KEY")
+    crypto_basket_sync_enabled: bool = Field(
+        default=False,
+        alias="CRYPTO_BASKET_SYNC_ENABLED",
+    )
+    crypto_basket_sync_interval_seconds: int = Field(
+        default=900,
+        ge=60,
+        alias="CRYPTO_BASKET_SYNC_INTERVAL_SECONDS",
+    )
+    crypto_basket_running_stale_seconds: int = Field(
+        default=3600,
+        ge=60,
+        alias="CRYPTO_BASKET_RUNNING_STALE_SECONDS",
+    )
     cors_allowed_origins: str = Field(
         default=DEFAULT_CORS_ALLOWED_ORIGINS,
         alias="CORS_ALLOWED_ORIGINS",

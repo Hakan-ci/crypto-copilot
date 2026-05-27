@@ -4,6 +4,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 from uuid import uuid4
 
+import pytest
+
 from app.api.routes import trades as trade_routes
 from app.core.config import Settings
 from app.db.models import Candle
@@ -11,6 +13,16 @@ from app.schemas.indicators import (
     IndicatorSnapshotCalculationRequest,
     IndicatorSnapshotCalculationResponse,
 )
+from app.schemas.trades import (
+    AiTradeQuestionRead,
+    AiTradeQuestionRequest,
+    IndicatorObservations,
+    TimeframeAlignment,
+    TradeReviewOutput,
+    TradeReviewRequest,
+    TradeReviewResponse,
+)
+from app.services.ai_review_engine import OpenAiNotConfiguredError
 
 
 def make_settings() -> Settings:
@@ -145,3 +157,117 @@ def test_list_position_candles_reads_expected_position_timeframe_range(monkeypat
     ]
     assert response[0].id == candle_id
     assert response[0].close == Decimal("105")
+
+
+def test_review_position_ignores_request_user_rules(monkeypatch):
+    position_id = uuid4()
+    calls: list[dict[str, object]] = []
+
+    class FakeAiReviewEngine:
+        def __init__(self, db, openai_api_key, model):
+            _ = (db, openai_api_key, model)
+
+        async def generate_review(self, position_id, similar_past_trade_stats=None):
+            calls.append(
+                {
+                    "position_id": position_id,
+                    "similar_past_trade_stats": similar_past_trade_stats,
+                }
+            )
+            return TradeReviewResponse(
+                position_id=position_id,
+                review_id=None,
+                review=TradeReviewOutput(
+                    summary="Educational review.",
+                    timeframe_alignment=TimeframeAlignment(
+                        one_hour="unknown",
+                        four_hour="unknown",
+                        one_day="unknown",
+                        overall="unknown",
+                    ),
+                    indicator_observations=IndicatorObservations(
+                        rsi=[],
+                        stoch_rsi=[],
+                        macd=[],
+                        supertrend=[],
+                    ),
+                    strengths=[],
+                    weaknesses=[],
+                    risk_flags=[],
+                    mistake_tags=[],
+                    rule_match_score=None,
+                    risk_score=None,
+                    execution_score=None,
+                    final_note="Final decision belongs to the user.",
+                ),
+            )
+
+    monkeypatch.setattr(trade_routes, "AiReviewEngine", FakeAiReviewEngine)
+
+    asyncio.run(
+        trade_routes.review_position(
+            position_id=position_id,
+            request=TradeReviewRequest(
+                user_rules={"notes": "browser-only override"},
+                similar_past_trade_stats={"wins": 1},
+            ),
+            db=object(),
+            settings=make_settings(),
+        )
+    )
+
+    assert calls == [
+        {
+            "position_id": position_id,
+            "similar_past_trade_stats": {"wins": 1},
+        }
+    ]
+
+
+def test_ai_question_routes_delegate_and_map_missing_key(monkeypatch):
+    position_id = uuid4()
+    question_id = uuid4()
+    user_id = uuid4()
+    created_at = datetime.fromtimestamp(1_710_000_000, tz=UTC)
+
+    class FakeAiReviewEngine:
+        def __init__(self, db, openai_api_key, model):
+            _ = (db, openai_api_key, model)
+
+        def list_questions(self, position_id):
+            return [
+                AiTradeQuestionRead(
+                    id=question_id,
+                    user_id=user_id,
+                    position_id=position_id,
+                    question="What happened?",
+                    answer="A retrospective answer.",
+                    context_json={},
+                    model="gpt-4o-mini",
+                    created_at=created_at,
+                )
+            ]
+
+        async def answer_question(self, position_id, question):
+            _ = (position_id, question)
+            raise OpenAiNotConfiguredError("OpenAI API key is missing.")
+
+    monkeypatch.setattr(trade_routes, "AiReviewEngine", FakeAiReviewEngine)
+
+    questions = trade_routes.list_ai_questions(
+        position_id=position_id,
+        db=object(),
+        settings=make_settings(),
+    )
+
+    assert questions[0].id == question_id
+    with pytest.raises(trade_routes.HTTPException) as exc_info:
+        asyncio.run(
+            trade_routes.ask_ai_question(
+                position_id=position_id,
+                request=AiTradeQuestionRequest(question="What happened?"),
+                db=object(),
+                settings=make_settings(),
+            )
+        )
+    assert exc_info.value.status_code == 503

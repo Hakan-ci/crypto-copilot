@@ -10,10 +10,10 @@ export function IndicatorSnapshotPanel({ snapshot }: { snapshot: IndicatorSnapsh
       <div className="mb-4 flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h3 className="text-base font-semibold text-slate-950">
-            {timeframeLabel(snapshot.timeframe)} snapshot
+            {timeframeLabel(snapshot.timeframe)} {snapshot.anchor} snapshot
           </h3>
           <p className="text-sm text-slate-600">
-            Candle at or before entry: {formatDateTime(snapshot.timestamp)}
+            Candle at or before {snapshot.anchor}: {formatDateTime(snapshot.timestamp)}
           </p>
         </div>
         <p className="text-sm font-medium text-slate-700">Price {formatDecimal(snapshot.price, 4)}</p>

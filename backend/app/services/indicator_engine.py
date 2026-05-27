@@ -25,6 +25,8 @@ SUPERTREND_ATR_LENGTH = 10
 SUPERTREND_MULTIPLIER = Decimal("3")
 ATR_14_LENGTH = 14
 VOLUME_RELATIVE_LENGTH = 20
+ENTRY_ANCHOR = "entry"
+EXIT_ANCHOR = "exit"
 
 
 class PositionNotFoundError(ValueError):
@@ -52,30 +54,38 @@ class IndicatorEngine:
                 raise PositionNotFoundError(f"Position not found: {position_id}")
 
             for timeframe in normalized_timeframes:
-                candles = self._load_candles_for_snapshot(position=position, timeframe=timeframe)
-                if not candles:
-                    warnings.append(
-                        f"No candles found for position {position_id} timeframe {timeframe}."
+                for anchor, anchor_at in self._snapshot_anchors(position).items():
+                    candles = self._load_candles_for_snapshot(
+                        position=position,
+                        timeframe=timeframe,
+                        anchor_at=anchor_at,
                     )
-                    continue
+                    if not candles:
+                        warnings.append(
+                            f"No candles found for position {position_id} "
+                            f"timeframe {timeframe} {anchor}."
+                        )
+                        continue
 
-                snapshot_values = self._calculate_snapshot_values(
-                    position=position,
-                    timeframe=timeframe,
-                    candles=candles,
-                    warnings=warnings,
-                )
-                snapshot = self._get_existing_snapshot(
-                    position_id=position_id,
-                    timeframe=timeframe,
-                )
-                if snapshot is None:
-                    snapshot = IndicatorSnapshot(position_id=position_id, **snapshot_values)
-                    self._save_snapshot(snapshot)
-                else:
-                    self._update_snapshot(snapshot=snapshot, values=snapshot_values)
+                    snapshot_values = self._calculate_snapshot_values(
+                        position=position,
+                        timeframe=timeframe,
+                        anchor=anchor,
+                        candles=candles,
+                        warnings=warnings,
+                    )
+                    snapshot = self._get_existing_snapshot(
+                        position_id=position_id,
+                        timeframe=timeframe,
+                        anchor=anchor,
+                    )
+                    if snapshot is None:
+                        snapshot = IndicatorSnapshot(position_id=position_id, **snapshot_values)
+                        self._save_snapshot(snapshot)
+                    else:
+                        self._update_snapshot(snapshot=snapshot, values=snapshot_values)
 
-                snapshots_created_or_updated += 1
+                    snapshots_created_or_updated += 1
 
         return IndicatorSnapshotCalculationResponse(
             position_id=position_id,
@@ -90,14 +100,15 @@ class IndicatorEngine:
         self,
         position: FuturesPosition,
         timeframe: str,
+        anchor_at: datetime,
     ) -> list[Candle]:
-        opened_at_s = self._datetime_to_seconds(position.opened_at)
+        anchor_at_s = self._datetime_to_seconds(anchor_at)
         statement = (
             select(Candle)
             .where(Candle.exchange == MEXC_EXCHANGE)
             .where(Candle.symbol == position.symbol)
             .where(Candle.timeframe == timeframe)
-            .where(Candle.timestamp_s <= opened_at_s)
+            .where(Candle.timestamp_s <= anchor_at_s)
             .order_by(Candle.timestamp_s.asc())
         )
         return list(self.db.scalars(statement).all())
@@ -106,11 +117,13 @@ class IndicatorEngine:
         self,
         position_id: UUID,
         timeframe: str,
+        anchor: str,
     ) -> IndicatorSnapshot | None:
         statement = (
             select(IndicatorSnapshot)
             .where(IndicatorSnapshot.position_id == position_id)
             .where(IndicatorSnapshot.timeframe == timeframe)
+            .where(IndicatorSnapshot.anchor == anchor)
         )
         return self.db.scalar(statement)
 
@@ -125,6 +138,7 @@ class IndicatorEngine:
         self,
         position: FuturesPosition,
         timeframe: str,
+        anchor: str,
         candles: list[Candle],
         warnings: list[str],
     ) -> dict[str, object]:
@@ -189,6 +203,7 @@ class IndicatorEngine:
         return {
             "symbol": position.symbol,
             "timeframe": timeframe,
+            "anchor": anchor,
             "timestamp": snapshot_candle.timestamp,
             "price": self._decimal(snapshot_candle.close),
             "rsi_14": rsi_14,
@@ -203,6 +218,12 @@ class IndicatorEngine:
             "volume_relative": volume_relative,
             "trend_label": trend_label,
         }
+
+    def _snapshot_anchors(self, position: FuturesPosition) -> dict[str, datetime]:
+        anchors = {ENTRY_ANCHOR: position.opened_at}
+        if position.closed_at is not None:
+            anchors[EXIT_ANCHOR] = position.closed_at
+        return anchors
 
     def _rsi(self, closes: list[Decimal], length: int) -> Decimal | None:
         if len(closes) < length + 1:

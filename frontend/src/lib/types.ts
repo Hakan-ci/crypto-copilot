@@ -22,6 +22,9 @@ export interface Position {
   raw_source: string | null;
   created_at: string;
   net_pnl?: string;
+  plan_score?: number | null;
+  plan_failed_items_count?: number;
+  plan_unknown_items_count?: number;
 }
 
 export interface IndicatorSnapshot {
@@ -29,6 +32,7 @@ export interface IndicatorSnapshot {
   position_id: string;
   symbol: string;
   timeframe: Timeframe;
+  anchor: "entry" | "exit" | string;
   timestamp: string;
   price: string;
   rsi_14: string | null;
@@ -95,6 +99,166 @@ export interface PositionDetail {
   position: Position;
   indicator_snapshots: IndicatorSnapshot[];
   ai_review: AiTradeReview | null;
+  plan_evaluation: TradingPlanEvaluation | null;
+  transaction_timeline: PositionTransaction[];
+  transaction_timeline_source: "linked" | "inferred" | "unavailable";
+}
+
+export interface PositionTransaction {
+  id: string;
+  raw_mexc_order_deal_id: string | null;
+  mexc_deal_id: string;
+  order_id: string;
+  side: number;
+  side_label: string;
+  vol: string;
+  price: string;
+  fee: string;
+  fee_currency: string | null;
+  profit: string;
+  timestamp: string;
+  timestamp_ms: number;
+  source: "linked" | "inferred";
+}
+
+export type TradingPlanRuleType =
+  | "manual_check"
+  | "allowed_symbols"
+  | "required_timeframes"
+  | "max_trades_per_day"
+  | "max_leverage"
+  | "max_risk_per_trade"
+  | "min_risk_reward";
+
+export type TradingPlanEvaluationStatus = "passed" | "failed" | "unknown" | "manual";
+
+export interface TradingPlanItem {
+  id: string;
+  trading_plan_id: string;
+  sort_order: number;
+  title: string;
+  description: string | null;
+  category: string | null;
+  rule_type: TradingPlanRuleType;
+  enabled: boolean;
+  config: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TradingPlanItemInput {
+  id?: string | null;
+  sort_order: number;
+  title: string;
+  description?: string | null;
+  category?: string | null;
+  rule_type: TradingPlanRuleType;
+  enabled: boolean;
+  config: Record<string, unknown>;
+}
+
+export interface TradingPlan {
+  id: string;
+  user_id: string;
+  items: TradingPlanItem[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TradingPlanUpsert {
+  items: TradingPlanItemInput[];
+}
+
+export type CryptoBasketSyncStatus = "idle" | "running" | "success" | "error";
+export type CryptoBasketSyncRunStatus = "running" | "success" | "error" | "skipped";
+export type CryptoBasketSyncRunType = "manual" | "automatic";
+
+export interface CryptoBasketItem {
+  id: string;
+  basket_id: string;
+  sort_order: number;
+  symbol: string;
+  enabled: boolean;
+  sync_status: CryptoBasketSyncStatus;
+  last_sync_started_at: string | null;
+  last_sync_finished_at: string | null;
+  last_successful_sync_at: string | null;
+  last_sync_start_time_ms: number | null;
+  last_sync_end_time_ms: number | null;
+  last_imported: number;
+  last_skipped_duplicates: number;
+  last_positions_created: number;
+  last_open_positions: number;
+  last_closed_positions: number;
+  last_warnings: string[];
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CryptoBasketItemInput {
+  id?: string | null;
+  sort_order: number;
+  symbol: string;
+  enabled: boolean;
+}
+
+export interface CryptoBasket {
+  id: string;
+  user_id: string;
+  items: CryptoBasketItem[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CryptoBasketUpsert {
+  items: CryptoBasketItemInput[];
+}
+
+export interface CryptoBasketSyncRun {
+  id: string;
+  basket_id: string;
+  basket_item_id: string;
+  symbol: string;
+  run_type: CryptoBasketSyncRunType;
+  status: CryptoBasketSyncRunStatus;
+  started_at: string;
+  finished_at: string | null;
+  start_time_ms: number | null;
+  end_time_ms: number | null;
+  imported: number;
+  skipped_duplicates: number;
+  positions_created: number;
+  open_positions: number;
+  closed_positions: number;
+  warnings: string[];
+  error: string | null;
+}
+
+export interface CryptoBasketSyncResponse {
+  basket: CryptoBasket;
+  runs: CryptoBasketSyncRun[];
+}
+
+export interface TradingPlanEvaluationItem {
+  item_id: string;
+  sort_order: number;
+  title: string;
+  description: string | null;
+  category: string | null;
+  rule_type: TradingPlanRuleType;
+  status: TradingPlanEvaluationStatus;
+  message: string;
+}
+
+export interface TradingPlanEvaluation {
+  score: number | null;
+  passed_items_count: number;
+  failed_items_count: number;
+  unknown_items_count: number;
+  manual_items_count: number;
+  total_scored_items: number;
+  items: TradingPlanEvaluationItem[];
 }
 
 export interface ImportOrderDealsRequest {
@@ -148,15 +312,6 @@ export interface PositionFilters {
   timeframe?: Timeframe;
 }
 
-export interface UserTradingRules {
-  max_risk_per_trade?: string | null;
-  min_risk_reward?: string | null;
-  allowed_timeframes?: string[] | null;
-  allowed_symbols?: string[] | null;
-  max_trades_per_day?: number | null;
-  notes?: string | null;
-}
-
 export interface TimeframeAlignment {
   one_hour: string;
   four_hour: string;
@@ -183,6 +338,13 @@ export interface TradeReviewOutput {
   risk_score: number | null;
   execution_score: number | null;
   final_note: string;
+  transaction_timeline?: string[];
+  entry_analysis?: string[];
+  exit_analysis?: string[];
+  plan_compliance?: string[];
+  execution_notes?: string[];
+  missed_context?: string[];
+  follow_up_questions?: string[];
 }
 
 export interface TradeReviewResponse {
@@ -195,4 +357,15 @@ export interface IndicatorSnapshotCalculationResponse {
   position_id: string;
   snapshots_created_or_updated: number;
   warnings: string[];
+}
+
+export interface AiTradeQuestion {
+  id: string;
+  user_id: string;
+  position_id: string;
+  question: string;
+  answer: string;
+  context_json: Record<string, unknown>;
+  model: string;
+  created_at: string;
 }

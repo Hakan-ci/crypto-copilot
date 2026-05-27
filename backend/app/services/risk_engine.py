@@ -17,6 +17,8 @@ from app.schemas.trades import (
     PositionListItem,
     SymbolPerformance,
 )
+from app.services.position_context import PositionContextService
+from app.services.trading_plan_service import TradingPlanService
 
 MEXC_EXCHANGE = "MEXC"
 ZERO = Decimal("0")
@@ -106,12 +108,18 @@ class RiskEngine:
         end = self._normalize_datetime(end)
 
         positions = self._load_user_positions(user_id=user_id)
+        all_user_positions = positions
+        all_snapshots = self._load_snapshots_for_positions(
+            [position.id for position in positions if position.id is not None]
+        )
+        snapshots_by_position: dict[UUID, list[IndicatorSnapshot]] = {}
+        for snapshot in all_snapshots:
+            snapshots_by_position.setdefault(snapshot.position_id, []).append(snapshot)
+
         if normalized_timeframe:
             position_ids_with_timeframe = {
                 snapshot.position_id
-                for snapshot in self._load_snapshots_for_positions(
-                    [position.id for position in positions if position.id is not None]
-                )
+                for snapshot in all_snapshots
                 if snapshot.timeframe == normalized_timeframe
             }
             positions = [
@@ -128,7 +136,20 @@ class RiskEngine:
             and (end is None or self._normalize_datetime(position.opened_at) <= end)
         ]
 
-        return [self._position_list_item(position) for position in filtered_positions]
+        plan_service = TradingPlanService(db=self.db)
+        plan = plan_service.load_active_plan(user_id=user_id)
+        return [
+            self._position_list_item(
+                position=position,
+                plan_evaluation=plan_service.evaluate_position(
+                    plan=plan,
+                    position=position,
+                    snapshots=snapshots_by_position.get(position.id, []),
+                    positions_for_daily_count=all_user_positions,
+                ),
+            )
+            for position in filtered_positions
+        ]
 
     def get_position_detail(self, position_id: UUID) -> PositionDetail | None:
         position = self._load_position(position_id=position_id)
@@ -140,8 +161,24 @@ class RiskEngine:
             for snapshot in self._load_position_snapshots(position_id=position_id)
             if snapshot.timeframe in SUPPORTED_TIMEFRAMES
         ]
-        snapshots.sort(key=lambda snapshot: SUPPORTED_TIMEFRAMES.index(snapshot.timeframe))
+        snapshots.sort(
+            key=lambda snapshot: (
+                SUPPORTED_TIMEFRAMES.index(snapshot.timeframe),
+                {"entry": 0, "exit": 1}.get(getattr(snapshot, "anchor", None) or "entry", 99),
+            )
+        )
         review = self._load_latest_review(position_id=position_id)
+        transaction_timeline, transaction_timeline_source = PositionContextService(
+            db=self.db
+        ).transaction_timeline(position)
+        plan_service = TradingPlanService(db=self.db)
+        plan = plan_service.load_active_plan(user_id=position.user_id)
+        plan_evaluation = plan_service.evaluate_position(
+            plan=plan,
+            position=position,
+            snapshots=snapshots,
+            positions_for_daily_count=self._load_user_positions(user_id=position.user_id),
+        )
 
         return PositionDetail(
             position=FuturesPositionRead.model_validate(position),
@@ -149,6 +186,9 @@ class RiskEngine:
                 IndicatorSnapshotRead.model_validate(snapshot) for snapshot in snapshots
             ],
             ai_review=AiTradeReviewRead.model_validate(review) if review else None,
+            plan_evaluation=plan_evaluation,
+            transaction_timeline=transaction_timeline,
+            transaction_timeline_source=transaction_timeline_source,
         )
 
     def _load_user_positions(self, user_id: UUID) -> list[FuturesPosition]:
@@ -207,6 +247,8 @@ class RiskEngine:
         macd_against_trades = 0
 
         for snapshot in snapshots:
+            if (getattr(snapshot, "anchor", None) or "entry") != "entry":
+                continue
             position = position_by_id.get(snapshot.position_id)
             if position is None:
                 continue
@@ -280,10 +322,13 @@ class RiskEngine:
             for symbol in sorted_symbols[:5]
         ]
 
-    def _position_list_item(self, position: FuturesPosition) -> PositionListItem:
+    def _position_list_item(self, position: FuturesPosition, plan_evaluation) -> PositionListItem:
         return PositionListItem(
             **FuturesPositionRead.model_validate(position).model_dump(),
             net_pnl=self._net_pnl(position),
+            plan_score=plan_evaluation.score,
+            plan_failed_items_count=plan_evaluation.failed_items_count,
+            plan_unknown_items_count=plan_evaluation.unknown_items_count,
         )
 
     def _net_pnl(self, position: FuturesPosition) -> Decimal:

@@ -25,6 +25,7 @@ export function PositionsTable({ positions }: { positions: Position[] }) {
               <th className="px-4 py-3">Entry</th>
               <th className="px-4 py-3">Exit</th>
               <th className="px-4 py-3">Net PnL</th>
+              <th className="px-4 py-3">Plan</th>
               <th className="px-4 py-3">Review</th>
             </tr>
           </thead>
@@ -57,6 +58,9 @@ export function PositionsTable({ positions }: { positions: Position[] }) {
                   {formatCurrency(position.net_pnl ?? position.realized_pnl)}
                 </td>
                 <td className="whitespace-nowrap px-4 py-3">
+                  <PlanBadge position={position} />
+                </td>
+                <td className="whitespace-nowrap px-4 py-3">
                   <Link
                     href={`/positions/${position.id}`}
                     className="rounded-md border border-stone-300 px-3 py-1.5 text-sm font-medium text-slate-800 hover:bg-stone-100"
@@ -70,5 +74,37 @@ export function PositionsTable({ positions }: { positions: Position[] }) {
         </table>
       </div>
     </div>
+  );
+}
+
+function PlanBadge({ position }: { position: Position }) {
+  const failedCount = position.plan_failed_items_count ?? 0;
+  const unknownCount = position.plan_unknown_items_count ?? 0;
+  const score = position.plan_score;
+
+  if (score === null || score === undefined) {
+    if (unknownCount > 0) {
+      return (
+        <span className="inline-flex rounded-md border border-stone-200 bg-stone-50 px-2 py-1 text-xs font-semibold text-slate-700">
+          {unknownCount} unknown
+        </span>
+      );
+    }
+    return <span className="text-sm text-slate-500">-</span>;
+  }
+
+  const tone =
+    failedCount > 0
+      ? "border-red-200 bg-red-50 text-red-700"
+      : unknownCount > 0
+        ? "border-amber-200 bg-amber-50 text-amber-800"
+        : "border-emerald-200 bg-emerald-50 text-emerald-700";
+
+  return (
+    <span className={`inline-flex rounded-md border px-2 py-1 text-xs font-semibold ${tone}`}>
+      {score}/100
+      {failedCount > 0 ? `, ${failedCount} failed` : ""}
+      {failedCount === 0 && unknownCount > 0 ? `, ${unknownCount} unknown` : ""}
+    </span>
   );
 }

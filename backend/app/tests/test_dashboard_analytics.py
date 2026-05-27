@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from app.db.models import AiTradeReview, FuturesPosition, IndicatorSnapshot
+from app.schemas.trading_plan import TradingPlanEvaluation
 from app.services.risk_engine import RiskEngine
 
 
@@ -354,3 +355,35 @@ def test_position_detail_returns_snapshots_and_latest_review():
     ]
     assert detail.ai_review is not None
     assert detail.ai_review.summary == "Latest review"
+
+
+def test_positions_include_trading_plan_summary(monkeypatch):
+    user_id = uuid4()
+    position = make_position(user_id)
+    evaluation = TradingPlanEvaluation(
+        score=50,
+        passed_items_count=1,
+        failed_items_count=1,
+        unknown_items_count=2,
+        manual_items_count=0,
+        total_scored_items=2,
+        items=[],
+    )
+
+    monkeypatch.setattr(
+        "app.services.trading_plan_service.TradingPlanService.load_active_plan",
+        lambda self, user_id: object(),
+    )
+    monkeypatch.setattr(
+        "app.services.trading_plan_service.TradingPlanService.evaluate_position",
+        lambda self, plan, position, snapshots, positions_for_daily_count: evaluation,
+    )
+
+    listed = make_engine(positions=[position]).list_positions(user_id=user_id)
+    detail = make_engine(positions=[position]).get_position_detail(position_id=position.id)
+
+    assert listed[0].plan_score == 50
+    assert listed[0].plan_failed_items_count == 1
+    assert listed[0].plan_unknown_items_count == 2
+    assert detail is not None
+    assert detail.plan_evaluation == evaluation

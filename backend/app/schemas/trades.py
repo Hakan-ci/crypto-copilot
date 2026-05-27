@@ -6,6 +6,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.indicators import IndicatorSnapshotRead
+from app.schemas.trading_plan import TradingPlanEvaluation, TradingPlanReviewContext
 
 
 class FuturesPositionRead(BaseModel):
@@ -32,6 +33,9 @@ class FuturesPositionRead(BaseModel):
 
 class PositionListItem(FuturesPositionRead):
     net_pnl: Decimal
+    plan_score: int | None = Field(default=None, ge=0, le=100)
+    plan_failed_items_count: int = 0
+    plan_unknown_items_count: int = 0
 
 
 class IndicatorSummary(BaseModel):
@@ -83,10 +87,30 @@ class AiTradeReviewRead(BaseModel):
     created_at: datetime
 
 
+class PositionTransactionRead(BaseModel):
+    id: UUID
+    raw_mexc_order_deal_id: UUID | None = None
+    mexc_deal_id: str
+    order_id: str
+    side: int
+    side_label: str
+    vol: Decimal
+    price: Decimal
+    fee: Decimal
+    fee_currency: str | None = None
+    profit: Decimal
+    timestamp: datetime
+    timestamp_ms: int
+    source: Literal["linked", "inferred"]
+
+
 class PositionDetail(BaseModel):
     position: FuturesPositionRead
     indicator_snapshots: list[IndicatorSnapshotRead]
     ai_review: AiTradeReviewRead | None = None
+    plan_evaluation: TradingPlanEvaluation | None = None
+    transaction_timeline: list[PositionTransactionRead] = Field(default_factory=list)
+    transaction_timeline_source: Literal["linked", "inferred", "unavailable"] = "unavailable"
 
 
 class ReconstructionReport(BaseModel):
@@ -110,6 +134,7 @@ class TradeReviewPositionInput(BaseModel):
 
 class TradeReviewIndicatorSnapshotInput(BaseModel):
     timeframe: str
+    anchor: Literal["entry", "exit"] = "entry"
     rsi_14: Decimal | None = None
     stoch_rsi_k: Decimal | None = None
     stoch_rsi_d: Decimal | None = None
@@ -135,6 +160,10 @@ class UserTradingRules(BaseModel):
 class TradeReviewInput(BaseModel):
     position: TradeReviewPositionInput
     indicator_snapshots: list[TradeReviewIndicatorSnapshotInput]
+    transaction_timeline: list[PositionTransactionRead] = Field(default_factory=list)
+    transaction_timeline_source: Literal["linked", "inferred", "unavailable"] = "unavailable"
+    trading_plan: TradingPlanReviewContext | None = None
+    plan_evaluation: TradingPlanEvaluation | None = None
     user_rules: UserTradingRules | None = None
     similar_past_trade_stats: dict[str, Any] | None = None
 
@@ -165,6 +194,13 @@ class TradeReviewOutput(BaseModel):
     risk_score: int | None = Field(default=None, ge=0, le=100)
     execution_score: int | None = Field(default=None, ge=0, le=100)
     final_note: str
+    transaction_timeline: list[str] = Field(default_factory=list)
+    entry_analysis: list[str] = Field(default_factory=list)
+    exit_analysis: list[str] = Field(default_factory=list)
+    plan_compliance: list[str] = Field(default_factory=list)
+    execution_notes: list[str] = Field(default_factory=list)
+    missed_context: list[str] = Field(default_factory=list)
+    follow_up_questions: list[str] = Field(default_factory=list)
 
     @field_validator("summary", "final_note")
     @classmethod
@@ -183,3 +219,28 @@ class TradeReviewResponse(BaseModel):
     position_id: UUID
     review_id: UUID | None = None
     review: TradeReviewOutput
+
+
+class AiTradeQuestionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    user_id: UUID
+    position_id: UUID
+    question: str
+    answer: str
+    context_json: dict[str, Any]
+    model: str
+    created_at: datetime
+
+
+class AiTradeQuestionRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("question")
+    @classmethod
+    def require_non_empty_question(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Question must not be empty.")
+        return stripped

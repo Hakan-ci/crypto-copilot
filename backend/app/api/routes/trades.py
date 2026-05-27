@@ -15,6 +15,8 @@ from app.schemas.indicators import (
     IndicatorSnapshotCalculationResponse,
 )
 from app.schemas.trades import (
+    AiTradeQuestionRead,
+    AiTradeQuestionRequest,
     DashboardAnalytics,
     PositionDetail,
     PositionListItem,
@@ -24,6 +26,7 @@ from app.schemas.trades import (
 )
 from app.services.ai_review_engine import (
     AiReviewEngine,
+    OpenAiNotConfiguredError,
 )
 from app.services.ai_review_engine import (
     PositionNotFoundError as ReviewPositionNotFoundError,
@@ -187,11 +190,47 @@ async def review_position(
     try:
         return await engine.generate_review(
             position_id=position_id,
-            user_rules=request.user_rules,
             similar_past_trade_stats=request.similar_past_trade_stats,
         )
     except ReviewPositionNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/positions/{position_id}/ai-questions", response_model=list[AiTradeQuestionRead])
+def list_ai_questions(
+    position_id: UUID,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> list[AiTradeQuestionRead]:
+    engine = AiReviewEngine(
+        db=db,
+        openai_api_key=settings.openai_api_key,
+        model=settings.openai_review_model,
+    )
+    try:
+        return engine.list_questions(position_id=position_id)
+    except ReviewPositionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/positions/{position_id}/ai-questions", response_model=AiTradeQuestionRead)
+async def ask_ai_question(
+    position_id: UUID,
+    request: AiTradeQuestionRequest,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> AiTradeQuestionRead:
+    engine = AiReviewEngine(
+        db=db,
+        openai_api_key=settings.openai_api_key,
+        model=settings.openai_review_model,
+    )
+    try:
+        return await engine.answer_question(position_id=position_id, question=request.question)
+    except ReviewPositionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except OpenAiNotConfiguredError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 def _parse_datetime_query(value: str | None, label: str) -> datetime | None:

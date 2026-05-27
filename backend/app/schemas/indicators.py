@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class IndicatorSnapshotRead(BaseModel):
@@ -12,6 +12,7 @@ class IndicatorSnapshotRead(BaseModel):
     position_id: UUID
     symbol: str
     timeframe: str
+    anchor: str = "entry"
     timestamp: datetime
     price: Decimal
     rsi_14: Decimal | None = None
@@ -25,6 +26,11 @@ class IndicatorSnapshotRead(BaseModel):
     atr_14: Decimal | None = None
     volume_relative: Decimal | None = None
     trend_label: str | None = None
+
+    @field_validator("anchor", mode="before")
+    @classmethod
+    def default_missing_anchor(cls, value: str | None) -> str:
+        return value or "entry"
 
 
 class IndicatorSnapshotCalculationRequest(BaseModel):

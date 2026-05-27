@@ -5,7 +5,7 @@ import {
   BarChart3,
   BookOpenCheck,
   Cable,
-  Download,
+  CircleDollarSign,
   ListChecks,
   Settings
 } from "lucide-react";
@@ -18,7 +18,7 @@ import { useDevelopmentUserId } from "@/lib/storage";
 const navigation = [
   { href: "/dashboard", label: "Dashboard", icon: BarChart3 },
   { href: "/connect-mexc", label: "Connect MEXC", icon: Cable },
-  { href: "/import-history", label: "Import History", icon: Download },
+  { href: "/crypto-basket", label: "Crypto Basket", icon: CircleDollarSign },
   { href: "/positions", label: "Positions", icon: ListChecks },
   { href: "/settings/trading-plan", label: "Trading Plan", icon: BookOpenCheck }
 ];

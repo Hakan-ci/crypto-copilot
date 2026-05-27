@@ -47,8 +47,9 @@ class IndicatorEngineForTest(IndicatorEngine):
         self,
         position: FuturesPosition,
         timeframe: str,
+        anchor_at: datetime,
     ) -> list[Candle]:
-        opened_at_s = self._datetime_to_seconds(position.opened_at)
+        anchor_at_s = self._datetime_to_seconds(anchor_at)
         return sorted(
             [
                 candle
@@ -56,7 +57,7 @@ class IndicatorEngineForTest(IndicatorEngine):
                 if candle.exchange == "MEXC"
                 and candle.symbol == position.symbol
                 and candle.timeframe == timeframe
-                and candle.timestamp_s <= opened_at_s
+                and candle.timestamp_s <= anchor_at_s
             ],
             key=lambda candle: candle.timestamp_s,
         )
@@ -65,9 +66,14 @@ class IndicatorEngineForTest(IndicatorEngine):
         self,
         position_id: UUID,
         timeframe: str,
+        anchor: str,
     ) -> IndicatorSnapshot | None:
         for snapshot in self.db.snapshots:
-            if snapshot.position_id == position_id and snapshot.timeframe == timeframe:
+            if (
+                snapshot.position_id == position_id
+                and snapshot.timeframe == timeframe
+                and (snapshot.anchor or "entry") == anchor
+            ):
                 return snapshot
         return None
 
@@ -254,6 +260,28 @@ def test_idempotency_running_twice_updates_same_snapshot():
     assert len(db.snapshots) == 1
     assert db.snapshots[0] is first_snapshot
     assert db.snapshots[0].price == Decimal("222")
+
+
+def test_closed_position_gets_entry_and_exit_snapshots():
+    position_id = uuid4()
+    candles = make_candles(90)
+    db = FakeDbSession()
+    position = make_position(
+        position_id=position_id,
+        opened_at_s=candles[60].timestamp_s,
+    )
+    position.status = "closed"
+    position.closed_at = datetime.fromtimestamp(candles[80].timestamp_s, tz=UTC)
+    db.positions[position_id] = position
+    db.candles = candles
+    engine = IndicatorEngineForTest(db=db)
+
+    response = engine.calculate_snapshots(position_id=position_id, timeframes=["Min60"])
+
+    assert response.snapshots_created_or_updated == 2
+    assert [snapshot.anchor for snapshot in db.snapshots] == ["entry", "exit"]
+    assert db.snapshots[0].timestamp == candles[60].timestamp
+    assert db.snapshots[1].timestamp == candles[80].timestamp
 
 
 def test_decimal_conversion_does_not_break_database_insert():
