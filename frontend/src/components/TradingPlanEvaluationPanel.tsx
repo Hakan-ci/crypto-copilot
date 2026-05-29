@@ -76,12 +76,60 @@ export function TradingPlanEvaluationPanel({
                 </span>
               </div>
               <p className="mt-3 text-sm text-slate-700">{item.message}</p>
+              <RuleEvidence item={item} />
             </div>
           );
         })}
       </div>
     </section>
   );
+}
+
+function RuleEvidence({ item }: { item: TradingPlanEvaluation["items"][number] }) {
+  const primaryRows = [
+    item.timeframe ? ["Timeframe", item.timeframe] : null,
+    item.anchor ? ["Anchor", item.anchor] : null,
+    item.expected ? ["Expected", item.expected] : null,
+    item.observed ? ["Observed", item.observed] : null
+  ].filter(Boolean) as Array<[string, string]>;
+  const evidenceRows = evidenceEntries(item.evidence ?? {});
+  if (primaryRows.length === 0 && evidenceRows.length === 0) {
+    return null;
+  }
+
+  return (
+    <dl className="mt-3 grid gap-2 text-sm md:grid-cols-2 xl:grid-cols-4">
+      {[...primaryRows, ...evidenceRows].map(([label, value]) => (
+        <div key={`${item.item_id}-${label}`} className="rounded-md bg-stone-50 px-3 py-2">
+          <dt className="text-xs font-medium uppercase tracking-[0.12em] text-slate-500">
+            {label}
+          </dt>
+          <dd className="mt-1 break-words font-medium text-slate-800">{value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function evidenceEntries(evidence: Record<string, unknown>): Array<[string, string]> {
+  const hiddenKeys = new Set(["timeframe", "anchor", "expected", "observed", "applies"]);
+  return Object.entries(evidence)
+    .filter(([key, value]) => !hiddenKeys.has(key) && value !== null && value !== undefined)
+    .map(([key, value]) => [labelFromKey(key), evidenceValue(value)]);
+}
+
+function labelFromKey(key: string) {
+  return key.replaceAll("_", " ");
+}
+
+function evidenceValue(value: unknown) {
+  if (Array.isArray(value)) {
+    return value.length ? value.map((item) => String(item)).join(", ") : "none";
+  }
+  if (typeof value === "object" && value !== null) {
+    return JSON.stringify(value);
+  }
+  return String(value);
 }
 
 function SummaryPill({

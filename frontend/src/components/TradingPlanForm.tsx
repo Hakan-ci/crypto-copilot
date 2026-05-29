@@ -8,24 +8,11 @@ import type { ReactNode } from "react";
 import { EmptyState } from "@/components/EmptyState";
 import { getTradingPlan, putTradingPlan } from "@/lib/api";
 import { useDevelopmentUserId } from "@/lib/storage";
-import { TIMEFRAMES } from "@/lib/timeframes";
-import type {
-  TradingPlanItem,
-  TradingPlanItemInput,
-  TradingPlanRuleType
-} from "@/lib/types";
+import type { TradingPlanItem, TradingPlanItemInput } from "@/lib/types";
 
-const RULE_OPTIONS: Array<{ value: TradingPlanRuleType; label: string }> = [
-  { value: "manual_check", label: "Manual check" },
-  { value: "allowed_symbols", label: "Allowed symbols" },
-  { value: "required_timeframes", label: "Required timeframes" },
-  { value: "max_trades_per_day", label: "Max trades per day" },
-  { value: "max_leverage", label: "Max leverage" },
-  { value: "max_risk_per_trade", label: "Max risk per trade" },
-  { value: "min_risk_reward", label: "Minimum risk/reward" }
-];
-
-type DraftItem = Omit<TradingPlanItemInput, "id"> & { id?: string | null };
+type DraftItem = Pick<TradingPlanItemInput, "sort_order" | "title" | "description"> & {
+  id?: string | null;
+};
 
 export function TradingPlanForm() {
   const { userId, isReady } = useDevelopmentUserId();
@@ -46,8 +33,18 @@ export function TradingPlanForm() {
     }
   }, [planQuery.data]);
 
-  const normalizedItems = useMemo(
-    () => items.map((item, index) => ({ ...item, sort_order: index })),
+  const normalizedItems = useMemo<TradingPlanItemInput[]>(
+    () =>
+      items.map((item, index) => ({
+        id: item.id,
+        sort_order: index,
+        title: item.title,
+        description: item.description,
+        category: null,
+        rule_type: "manual_check",
+        enabled: true,
+        config: {}
+      })),
     [items]
   );
 
@@ -93,28 +90,13 @@ export function TradingPlanForm() {
     setSaved(false);
   }
 
-  function updateConfig(index: number, key: string, value: unknown) {
-    const item = items[index];
-    updateItem(index, {
-      ...item,
-      config: {
-        ...item.config,
-        [key]: value
-      }
-    });
-  }
-
   function addItem() {
     setItems((current) => [
       ...current,
       {
         sort_order: current.length,
-        title: "New plan item",
-        description: null,
-        category: null,
-        rule_type: "manual_check",
-        enabled: true,
-        config: {}
+        title: "New system rule",
+        description: null
       }
     ]);
     setSaved(false);
@@ -154,7 +136,7 @@ export function TradingPlanForm() {
           onClick={addItem}
         >
           <Plus className="h-4 w-4" aria-hidden="true" />
-          Add item
+          Add rule
         </button>
         <button
           className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-slate-900 px-4 text-sm font-medium text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
@@ -167,17 +149,17 @@ export function TradingPlanForm() {
       </div>
 
       {items.length === 0 ? (
-        <EmptyState title="No plan items yet">Add checklist and rule items to start.</EmptyState>
+        <EmptyState title="No system rules yet">Add system rules to start.</EmptyState>
       ) : (
         <div className="grid gap-4">
           {items.map((item, index) => (
             <div
-              key={item.id ?? `${item.rule_type}-${index}`}
+              key={item.id ?? `system-rule-${index}`}
               className="rounded-md border border-stone-200 bg-white p-4 shadow-soft"
             >
               <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
-                <div className="grid flex-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
-                  <label className="block xl:col-span-2">
+                <div className="flex-1">
+                  <label className="block">
                     <span className="text-sm font-medium text-slate-700">Title</span>
                     <input
                       className="mt-1 h-10 w-full rounded-md border border-stone-300 bg-white px-3 text-sm outline-none focus:border-teal-600"
@@ -187,53 +169,8 @@ export function TradingPlanForm() {
                       }
                     />
                   </label>
-                  <label className="block">
-                    <span className="text-sm font-medium text-slate-700">Category</span>
-                    <input
-                      className="mt-1 h-10 w-full rounded-md border border-stone-300 bg-white px-3 text-sm outline-none focus:border-teal-600"
-                      value={item.category ?? ""}
-                      onChange={(event) =>
-                        updateItem(index, {
-                          ...item,
-                          category: event.target.value || null
-                        })
-                      }
-                      placeholder="Risk, Setup, Exit"
-                    />
-                  </label>
-                  <label className="block">
-                    <span className="text-sm font-medium text-slate-700">Rule type</span>
-                    <select
-                      className="mt-1 h-10 w-full rounded-md border border-stone-300 bg-white px-3 text-sm outline-none focus:border-teal-600"
-                      value={item.rule_type}
-                      onChange={(event) => {
-                        const ruleType = event.target.value as TradingPlanRuleType;
-                        updateItem(index, {
-                          ...item,
-                          rule_type: ruleType,
-                          config: defaultConfigForRule(ruleType)
-                        });
-                      }}
-                    >
-                      {RULE_OPTIONS.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
                 </div>
                 <div className="flex items-center gap-2">
-                  <label className="inline-flex h-10 items-center gap-2 rounded-md border border-stone-300 bg-white px-3 text-sm font-medium text-slate-700">
-                    <input
-                      checked={item.enabled}
-                      onChange={(event) =>
-                        updateItem(index, { ...item, enabled: event.target.checked })
-                      }
-                      type="checkbox"
-                    />
-                    Enabled
-                  </label>
                   <IconButton
                     label="Move up"
                     disabled={index === 0}
@@ -267,11 +204,6 @@ export function TradingPlanForm() {
                   }
                 />
               </label>
-
-              <RuleConfigFields
-                item={item}
-                onChange={(key, value) => updateConfig(index, key, value)}
-              />
             </div>
           ))}
         </div>
@@ -282,86 +214,6 @@ export function TradingPlanForm() {
       ) : null}
       {saved ? <p className="text-sm text-emerald-700">Trading plan saved.</p> : null}
     </form>
-  );
-}
-
-function RuleConfigFields({
-  item,
-  onChange
-}: {
-  item: DraftItem;
-  onChange: (key: string, value: unknown) => void;
-}) {
-  if (item.rule_type === "manual_check") {
-    return null;
-  }
-
-  if (item.rule_type === "allowed_symbols") {
-    return (
-      <label className="mt-3 block">
-        <span className="text-sm font-medium text-slate-700">Symbols</span>
-        <input
-          className="mt-1 h-10 w-full rounded-md border border-stone-300 bg-white px-3 text-sm uppercase outline-none focus:border-teal-600"
-          value={stringArray(item.config.symbols).join(", ")}
-          onChange={(event) =>
-            onChange(
-              "symbols",
-              event.target.value
-                .split(",")
-                .map((value) => value.trim().toUpperCase())
-                .filter(Boolean)
-            )
-          }
-          placeholder="BTC_USDT, ETH_USDT"
-        />
-      </label>
-    );
-  }
-
-  if (item.rule_type === "required_timeframes") {
-    const selectedTimeframes = new Set(stringArray(item.config.timeframes));
-    return (
-      <fieldset className="mt-3">
-        <legend className="text-sm font-medium text-slate-700">Required snapshots</legend>
-        <div className="mt-2 flex flex-wrap gap-2">
-          {TIMEFRAMES.map((timeframe) => (
-            <label
-              key={timeframe.value}
-              className="inline-flex h-9 items-center gap-2 rounded-md border border-stone-300 bg-white px-3 text-sm text-slate-700"
-            >
-              <input
-                checked={selectedTimeframes.has(timeframe.value)}
-                onChange={(event) => {
-                  const nextTimeframes = new Set(selectedTimeframes);
-                  if (event.target.checked) {
-                    nextTimeframes.add(timeframe.value);
-                  } else {
-                    nextTimeframes.delete(timeframe.value);
-                  }
-                  onChange("timeframes", Array.from(nextTimeframes));
-                }}
-                type="checkbox"
-              />
-              {timeframe.label}
-            </label>
-          ))}
-        </div>
-      </fieldset>
-    );
-  }
-
-  return (
-    <label className="mt-3 block max-w-xs">
-      <span className="text-sm font-medium text-slate-700">{limitLabel(item.rule_type)}</span>
-      <input
-        className="mt-1 h-10 w-full rounded-md border border-stone-300 bg-white px-3 text-sm outline-none focus:border-teal-600"
-        min="0"
-        step="any"
-        type="number"
-        value={String(item.config.limit ?? "")}
-        onChange={(event) => onChange("limit", event.target.value)}
-      />
-    </label>
   );
 }
 
@@ -395,40 +247,6 @@ function itemToDraft(item: TradingPlanItem): DraftItem {
     id: item.id,
     sort_order: item.sort_order,
     title: item.title,
-    description: item.description,
-    category: item.category,
-    rule_type: item.rule_type,
-    enabled: item.enabled,
-    config: item.config ?? {}
+    description: item.description
   };
-}
-
-function defaultConfigForRule(ruleType: TradingPlanRuleType): Record<string, unknown> {
-  if (ruleType === "allowed_symbols") {
-    return { symbols: [] };
-  }
-  if (ruleType === "required_timeframes") {
-    return { timeframes: TIMEFRAMES.map((timeframe) => timeframe.value) };
-  }
-  if (ruleType === "manual_check") {
-    return {};
-  }
-  return { limit: "" };
-}
-
-function stringArray(value: unknown): string[] {
-  return Array.isArray(value) ? value.map((item) => String(item)) : [];
-}
-
-function limitLabel(ruleType: TradingPlanRuleType) {
-  if (ruleType === "max_trades_per_day") {
-    return "Daily trade limit";
-  }
-  if (ruleType === "max_leverage") {
-    return "Leverage limit";
-  }
-  if (ruleType === "max_risk_per_trade") {
-    return "Maximum risk";
-  }
-  return "Minimum risk/reward";
 }

@@ -46,6 +46,7 @@ export interface IndicatorSnapshot {
   atr_14: string | null;
   volume_relative: string | null;
   trend_label: string | null;
+  candlestick_patterns: string[];
 }
 
 export interface AiTradeReview {
@@ -100,6 +101,7 @@ export interface PositionDetail {
   indicator_snapshots: IndicatorSnapshot[];
   ai_review: AiTradeReview | null;
   plan_evaluation: TradingPlanEvaluation | null;
+  trade_metadata: PositionTradeMetadata | null;
   transaction_timeline: PositionTransaction[];
   transaction_timeline_source: "linked" | "inferred" | "unavailable";
 }
@@ -128,7 +130,10 @@ export type TradingPlanRuleType =
   | "max_trades_per_day"
   | "max_leverage"
   | "max_risk_per_trade"
-  | "min_risk_reward";
+  | "min_risk_reward"
+  | "indicator_condition"
+  | "candlestick_pattern"
+  | "stop_loss";
 
 export type TradingPlanEvaluationStatus = "passed" | "failed" | "unknown" | "manual";
 
@@ -249,6 +254,11 @@ export interface TradingPlanEvaluationItem {
   rule_type: TradingPlanRuleType;
   status: TradingPlanEvaluationStatus;
   message: string;
+  timeframe?: string | null;
+  anchor?: string | null;
+  expected?: string | null;
+  observed?: string | null;
+  evidence?: Record<string, unknown>;
 }
 
 export interface TradingPlanEvaluation {
@@ -326,6 +336,12 @@ export interface IndicatorObservations {
   supertrend: string[];
 }
 
+export interface TradingPlanRuleResult {
+  title: string;
+  status: "followed" | "not_followed";
+  reason: string;
+}
+
 export interface TradeReviewOutput {
   summary: string;
   timeframe_alignment: TimeframeAlignment;
@@ -345,6 +361,14 @@ export interface TradeReviewOutput {
   execution_notes?: string[];
   missed_context?: string[];
   follow_up_questions?: string[];
+  abandoned_rules?: string[];
+  rule_violations?: string[];
+  trading_plan_rule_results?: TradingPlanRuleResult[];
+}
+
+export interface TradeReviewRequest {
+  review_timeframe: Timeframe;
+  similar_past_trade_stats?: Record<string, unknown> | null;
 }
 
 export interface TradeReviewResponse {
@@ -368,4 +392,18 @@ export interface AiTradeQuestion {
   context_json: Record<string, unknown>;
   model: string;
   created_at: string;
+}
+
+export interface PositionTradeMetadata {
+  id: string;
+  position_id: string;
+  planned_stop_loss_price: string | null;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PositionTradeMetadataUpsert {
+  planned_stop_loss_price?: string | null;
+  notes?: string | null;
 }

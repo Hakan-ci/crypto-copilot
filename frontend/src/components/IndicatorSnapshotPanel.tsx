@@ -19,6 +19,18 @@ export function IndicatorSnapshotPanel({ snapshot }: { snapshot: IndicatorSnapsh
         <p className="text-sm font-medium text-slate-700">Price {formatDecimal(snapshot.price, 4)}</p>
       </div>
       <IndicatorBadges snapshot={snapshot} />
+      {snapshot.candlestick_patterns.length ? (
+        <div className="mt-4 flex flex-wrap gap-2">
+          {snapshot.candlestick_patterns.map((pattern) => (
+            <span
+              key={pattern}
+              className="rounded-md bg-teal-50 px-2 py-1 text-xs font-medium capitalize text-teal-800"
+            >
+              {pattern.replaceAll("_", " ")}
+            </span>
+          ))}
+        </div>
+      ) : null}
       <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-3">
         <div>
           <dt className="text-slate-500">ATR 14</dt>

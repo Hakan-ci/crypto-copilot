@@ -22,7 +22,7 @@ MACD_FAST_EMA = 12
 MACD_SLOW_EMA = 26
 MACD_SIGNAL_EMA = 9
 SUPERTREND_ATR_LENGTH = 10
-SUPERTREND_MULTIPLIER = Decimal("3")
+SUPERTREND_MULTIPLIER = Decimal("1")
 ATR_14_LENGTH = 14
 VOLUME_RELATIVE_LENGTH = 20
 ENTRY_ANCHOR = "entry"
@@ -148,6 +148,7 @@ class IndicatorEngine:
         highs = [self._decimal(candle.high) for candle in candles]
         lows = [self._decimal(candle.low) for candle in candles]
         volumes = [self._decimal(candle.volume) for candle in candles]
+        candlestick_patterns = self._candlestick_patterns(candles)
 
         rsi_14 = self._rsi(closes=closes, length=RSI_LENGTH)
         stoch_rsi_k, stoch_rsi_d = self._stoch_rsi(
@@ -217,6 +218,7 @@ class IndicatorEngine:
             "atr_14": atr_14,
             "volume_relative": volume_relative,
             "trend_label": trend_label,
+            "candlestick_patterns": candlestick_patterns,
         }
 
     def _snapshot_anchors(self, position: FuturesPosition) -> dict[str, datetime]:
@@ -436,6 +438,93 @@ class IndicatorEngine:
         if macd_direction == "bearish" and supertrend_direction == "bearish":
             return "bearish"
         return "mixed"
+
+    def _candlestick_patterns(self, candles: list[Candle]) -> list[str]:
+        if not candles:
+            return []
+        sorted_candles = sorted(candles, key=lambda candle: candle.timestamp_s)
+        patterns: list[str] = []
+        current = sorted_candles[-1]
+        body = self._candle_body(current)
+        candle_range = self._candle_range(current)
+        upper_shadow = self._upper_shadow(current)
+        lower_shadow = self._lower_shadow(current)
+
+        if candle_range > ZERO and body <= candle_range * Decimal("0.1"):
+            patterns.append("doji")
+        small_upper_shadow = upper_shadow <= max(body, candle_range * Decimal("0.1"))
+        small_lower_shadow = lower_shadow <= max(body, candle_range * Decimal("0.1"))
+        if candle_range > ZERO and lower_shadow >= body * TWO and small_upper_shadow:
+            patterns.append("hammer")
+        if candle_range > ZERO and upper_shadow >= body * TWO and small_lower_shadow:
+            patterns.append("shooting_star")
+
+        if len(sorted_candles) >= 2:
+            previous = sorted_candles[-2]
+            if self._is_bearish(previous) and self._is_bullish(current):
+                opens_below_previous_close = (
+                    self._decimal(current.open) <= self._decimal(previous.close)
+                )
+                closes_above_previous_open = (
+                    self._decimal(current.close) >= self._decimal(previous.open)
+                )
+                if opens_below_previous_close and closes_above_previous_open:
+                    patterns.append("bullish_engulfing")
+            if self._is_bullish(previous) and self._is_bearish(current):
+                opens_above_previous_close = (
+                    self._decimal(current.open) >= self._decimal(previous.close)
+                )
+                closes_below_previous_open = (
+                    self._decimal(current.close) <= self._decimal(previous.open)
+                )
+                if opens_above_previous_close and closes_below_previous_open:
+                    patterns.append("bearish_engulfing")
+
+        if len(sorted_candles) >= 3:
+            first, middle, last = sorted_candles[-3:]
+            if (
+                self._is_bearish(first)
+                and self._candle_body(middle) <= self._candle_range(middle) * Decimal("0.35")
+                and self._is_bullish(last)
+                and self._decimal(last.close) > self._midpoint(first)
+            ):
+                patterns.append("morning_star")
+            if (
+                self._is_bullish(first)
+                and self._candle_body(middle) <= self._candle_range(middle) * Decimal("0.35")
+                and self._is_bearish(last)
+                and self._decimal(last.close) < self._midpoint(first)
+            ):
+                patterns.append("evening_star")
+
+        return sorted(set(patterns))
+
+    def _candle_body(self, candle: Candle) -> Decimal:
+        return abs(self._decimal(candle.close) - self._decimal(candle.open))
+
+    def _candle_range(self, candle: Candle) -> Decimal:
+        return max(self._decimal(candle.high) - self._decimal(candle.low), ZERO)
+
+    def _upper_shadow(self, candle: Candle) -> Decimal:
+        return self._decimal(candle.high) - max(
+            self._decimal(candle.open),
+            self._decimal(candle.close),
+        )
+
+    def _lower_shadow(self, candle: Candle) -> Decimal:
+        return min(
+            self._decimal(candle.open),
+            self._decimal(candle.close),
+        ) - self._decimal(candle.low)
+
+    def _is_bullish(self, candle: Candle) -> bool:
+        return self._decimal(candle.close) > self._decimal(candle.open)
+
+    def _is_bearish(self, candle: Candle) -> bool:
+        return self._decimal(candle.close) < self._decimal(candle.open)
+
+    def _midpoint(self, candle: Candle) -> Decimal:
+        return (self._decimal(candle.open) + self._decimal(candle.close)) / TWO
 
     def _rsi_label(self, rsi: Decimal | None) -> str | None:
         if rsi is None:

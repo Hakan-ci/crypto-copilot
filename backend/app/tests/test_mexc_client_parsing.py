@@ -187,6 +187,56 @@ def test_order_deal_parser_preserves_decimal_precision(monkeypatch):
     assert deals[0].raw_json["id"] == "deal-1"
 
 
+def test_stop_order_parser_reads_stop_loss_fields(monkeypatch):
+    client = MexcFuturesClient(access_key="access", secret_key="secret")
+    monkeypatch.setattr(client, "_timestamp_ms", lambda: "1710000000123")
+    FakeAsyncClient.payload = {
+        "success": True,
+        "data": [
+            {
+                "id": 1001,
+                "orderId": "0",
+                "symbol": "BTC_USDT",
+                "positionId": 2002,
+                "stopLossPrice": "98.123456789123456789",
+                "takeProfitPrice": "0",
+                "state": 3,
+                "triggerSide": 2,
+                "positionType": 1,
+                "vol": "1.5",
+                "realityVol": "1.5",
+                "placeOrderId": "entry-order",
+                "isFinished": 1,
+                "createTime": 1710000000123,
+                "updateTime": 1710000000456,
+            }
+        ],
+    }
+
+    orders = asyncio.run(
+        client.get_stop_orders(
+            symbol="BTC_USDT",
+            start_time_ms=1710000000000,
+            end_time_ms=1710003600000,
+            page_num=2,
+            page_size=50,
+        )
+    )
+
+    assert FakeAsyncClient.calls[0]["path"] == "/api/v1/private/stoporder/list/orders"
+    assert FakeAsyncClient.calls[0]["params"] == {
+        "symbol": "BTC_USDT",
+        "start_time": 1710000000000,
+        "end_time": 1710003600000,
+        "page_num": 2,
+        "page_size": 50,
+    }
+    assert orders[0].stop_order_id == "1001"
+    assert orders[0].stop_loss_price == Decimal("98.123456789123456789")
+    assert orders[0].trigger_side == 2
+    assert orders[0].position_type == 1
+
+
 def test_missing_data_raises_mexc_api_error():
     client = MexcFuturesClient(access_key=None, secret_key=None)
     FakeAsyncClient.payload = {"success": True}

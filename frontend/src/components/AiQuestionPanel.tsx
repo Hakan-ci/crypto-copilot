@@ -20,6 +20,10 @@ export function AiQuestionPanel({ positionId }: { positionId: string }) {
     onSuccess: () => {
       setQuestion("");
       void queryClient.invalidateQueries({ queryKey: ["ai-questions", positionId] });
+      void queryClient.invalidateQueries({ queryKey: ["position-detail", positionId] });
+    },
+    onError: () => {
+      void queryClient.invalidateQueries({ queryKey: ["position-detail", positionId] });
     }
   });
 

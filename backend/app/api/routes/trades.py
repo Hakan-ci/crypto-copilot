@@ -20,6 +20,8 @@ from app.schemas.trades import (
     DashboardAnalytics,
     PositionDetail,
     PositionListItem,
+    PositionTradeMetadataRead,
+    PositionTradeMetadataUpsert,
     ReconstructionReport,
     TradeReviewRequest,
     TradeReviewResponse,
@@ -27,6 +29,8 @@ from app.schemas.trades import (
 from app.services.ai_review_engine import (
     AiReviewEngine,
     OpenAiNotConfiguredError,
+    ReviewContextMissingError,
+    TradeReviewError,
 )
 from app.services.ai_review_engine import (
     PositionNotFoundError as ReviewPositionNotFoundError,
@@ -40,6 +44,10 @@ from app.services.indicator_engine import IndicatorEngine, PositionNotFoundError
 from app.services.mexc_client import MexcApiError
 from app.services.position_reconstructor import PositionReconstructor
 from app.services.risk_engine import RiskEngine
+from app.services.trade_metadata_service import (
+    TradeMetadataPositionNotFoundError,
+    TradeMetadataService,
+)
 
 router = APIRouter(tags=["trades"])
 
@@ -102,6 +110,43 @@ def get_position_detail(
     if detail is None:
         raise HTTPException(status_code=404, detail=f"Position not found: {position_id}")
     return detail
+
+
+@router.get(
+    "/positions/{position_id}/trade-metadata",
+    response_model=PositionTradeMetadataRead | None,
+)
+async def get_position_trade_metadata(
+    position_id: UUID,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> PositionTradeMetadataRead | None:
+    service = TradeMetadataService(db=db)
+    try:
+        return await service.sync_stop_loss_from_mexc(
+            position_id=position_id,
+            client=build_mexc_client(settings),
+        )
+    except TradeMetadataPositionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except MexcApiError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.put(
+    "/positions/{position_id}/trade-metadata",
+    response_model=PositionTradeMetadataRead,
+)
+def put_position_trade_metadata(
+    position_id: UUID,
+    payload: PositionTradeMetadataUpsert,
+    db: Annotated[Session, Depends(get_db)],
+) -> PositionTradeMetadataRead:
+    service = TradeMetadataService(db=db)
+    try:
+        return service.upsert_metadata(position_id=position_id, payload=payload)
+    except TradeMetadataPositionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.post(
@@ -188,12 +233,27 @@ async def review_position(
         model=settings.openai_review_model,
     )
     try:
+        await TradeMetadataService(db=db).sync_stop_loss_from_mexc(
+            position_id=position_id,
+            client=build_mexc_client(settings),
+        )
         return await engine.generate_review(
             position_id=position_id,
+            review_timeframe=request.review_timeframe,
             similar_past_trade_stats=request.similar_past_trade_stats,
         )
     except ReviewPositionNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TradeMetadataPositionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ReviewContextMissingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OpenAiNotConfiguredError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except TradeReviewError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except MexcApiError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.get("/positions/{position_id}/ai-questions", response_model=list[AiTradeQuestionRead])
@@ -226,11 +286,19 @@ async def ask_ai_question(
         model=settings.openai_review_model,
     )
     try:
+        await TradeMetadataService(db=db).sync_stop_loss_from_mexc(
+            position_id=position_id,
+            client=build_mexc_client(settings),
+        )
         return await engine.answer_question(position_id=position_id, question=request.question)
     except ReviewPositionNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TradeMetadataPositionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except OpenAiNotConfiguredError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except MexcApiError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 def _parse_datetime_query(value: str | None, label: str) -> datetime | None:

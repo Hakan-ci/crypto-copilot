@@ -65,6 +65,25 @@ class MexcOrderDealDTO(BaseModel):
     raw_json: dict[str, Any]
 
 
+class MexcStopOrderDTO(BaseModel):
+    stop_order_id: str
+    symbol: str
+    order_id: str | None = None
+    position_id: str | None = None
+    stop_loss_price: Decimal | None = None
+    take_profit_price: Decimal | None = None
+    state: int | None = None
+    trigger_side: int | None = None
+    position_type: int | None = None
+    vol: Decimal | None = None
+    reality_vol: Decimal | None = None
+    place_order_id: str | None = None
+    is_finished: int | None = None
+    create_time_ms: int | None = None
+    update_time_ms: int | None = None
+    raw_json: dict[str, Any]
+
+
 class MexcOrderDealsImportRequest(BaseModel):
     user_id: UUID
     symbol: str = Field(min_length=1)

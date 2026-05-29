@@ -1,4 +1,5 @@
 import json
+import re
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -9,10 +10,18 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.time import utc_now
-from app.db.models import AiTradeQuestion, AiTradeReview, FuturesPosition, IndicatorSnapshot
+from app.db.models import (
+    AiTradeQuestion,
+    AiTradeReview,
+    FuturesPosition,
+    IndicatorSnapshot,
+    PositionTradeMetadata,
+)
 from app.schemas.trades import (
+    DEFAULT_REVIEW_TIMEFRAME,
     AiTradeQuestionRead,
     IndicatorObservations,
+    PositionTradeMetadataRead,
     PositionTransactionRead,
     TimeframeAlignment,
     TradeReviewIndicatorSnapshotInput,
@@ -20,6 +29,7 @@ from app.schemas.trades import (
     TradeReviewOutput,
     TradeReviewPositionInput,
     TradeReviewResponse,
+    TradingPlanRuleResult,
 )
 from app.services.position_context import PositionContextService
 from app.services.trading_plan_service import TradingPlanService
@@ -61,6 +71,79 @@ SENSITIVE_KEY_FRAGMENTS = (
 )
 
 
+def _strict_object_schema(properties: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+def _string_array_schema() -> dict[str, Any]:
+    return {"type": "array", "items": {"type": "string"}}
+
+
+def _nullable_integer_schema() -> dict[str, Any]:
+    return {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+
+
+def trade_review_output_openai_schema() -> dict[str, Any]:
+    """Return a strict Responses API schema for TradeReviewOutput."""
+
+    return _strict_object_schema(
+        {
+            "summary": {"type": "string"},
+            "timeframe_alignment": _strict_object_schema(
+                {
+                    "one_hour": {"type": "string"},
+                    "four_hour": {"type": "string"},
+                    "one_day": {"type": "string"},
+                    "overall": {"type": "string"},
+                }
+            ),
+            "indicator_observations": _strict_object_schema(
+                {
+                    "rsi": _string_array_schema(),
+                    "stoch_rsi": _string_array_schema(),
+                    "macd": _string_array_schema(),
+                    "supertrend": _string_array_schema(),
+                }
+            ),
+            "strengths": _string_array_schema(),
+            "weaknesses": _string_array_schema(),
+            "risk_flags": _string_array_schema(),
+            "mistake_tags": _string_array_schema(),
+            "rule_match_score": _nullable_integer_schema(),
+            "risk_score": _nullable_integer_schema(),
+            "execution_score": _nullable_integer_schema(),
+            "final_note": {"type": "string"},
+            "transaction_timeline": _string_array_schema(),
+            "entry_analysis": _string_array_schema(),
+            "exit_analysis": _string_array_schema(),
+            "plan_compliance": _string_array_schema(),
+            "execution_notes": _string_array_schema(),
+            "missed_context": _string_array_schema(),
+            "follow_up_questions": _string_array_schema(),
+            "abandoned_rules": _string_array_schema(),
+            "rule_violations": _string_array_schema(),
+            "trading_plan_rule_results": {
+                "type": "array",
+                "items": _strict_object_schema(
+                    {
+                        "title": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": ["followed", "not_followed"],
+                        },
+                        "reason": {"type": "string"},
+                    }
+                ),
+            },
+        }
+    )
+
+
 class TradeReviewError(RuntimeError):
     pass
 
@@ -70,6 +153,10 @@ class PositionNotFoundError(ValueError):
 
 
 class OpenAiNotConfiguredError(TradeReviewError):
+    pass
+
+
+class ReviewContextMissingError(TradeReviewError):
     pass
 
 
@@ -91,38 +178,34 @@ class AiReviewEngine:
     async def generate_review(
         self,
         position_id: UUID,
+        review_timeframe: str = DEFAULT_REVIEW_TIMEFRAME,
         similar_past_trade_stats: dict[str, Any] | None = None,
     ) -> TradeReviewResponse:
         position = self._get_position(position_id)
         if position is None:
             raise PositionNotFoundError(f"Position not found: {position_id}")
 
+        normalized_timeframe = self._normalize_review_timeframe(review_timeframe)
         review_input = self._build_review_context(
             position=position,
+            review_timeframe=normalized_timeframe,
             similar_past_trade_stats=similar_past_trade_stats,
         )
-        entry_snapshots = self._entry_snapshots_by_timeframe(review_input.indicator_snapshots)
+        self._ensure_review_timeframe_snapshot(review_input)
+        if not self.openai_api_key:
+            raise OpenAiNotConfiguredError("OpenAI API key is missing.")
 
-        missing_timeframes = [
-            timeframe
-            for timeframe in REQUIRED_REVIEW_TIMEFRAMES
-            if timeframe not in entry_snapshots
-        ]
-        if missing_timeframes or not self.openai_api_key:
-            review = self._fallback_review(
-                review_input=review_input,
-                missing_timeframes=missing_timeframes,
-            )
-        else:
-            review = await self._generate_llm_review_or_fallback(review_input)
-
+        review = await self._generate_llm_review_or_fallback(review_input)
+        review = self._enforce_rule_only_review(review=review, review_input=review_input)
         if self.contains_forbidden_phrase(review):
-            review = self._fallback_review(
-                review_input=review_input,
-                missing_timeframes=missing_timeframes,
-            )
+            raise TradeReviewError("AI review failed safety checks.")
 
-        review_row = self._save_review(position=position, review=review)
+        review = self._sanitize_review_text(review)
+        review_row = self._save_review(
+            position=position,
+            review=review,
+            review_timeframe=normalized_timeframe,
+        )
         return TradeReviewResponse(
             position_id=position_id,
             review_id=getattr(review_row, "id", None),
@@ -171,6 +254,7 @@ class AiReviewEngine:
                 "context, review the transaction timing, plan compliance, and documented "
                 "risk flags before making your own decision."
             )
+        answer = self._plain_text(answer, fallback="I could not create a clear answer.")
 
         row = AiTradeQuestion(
             user_id=position.user_id,
@@ -215,11 +299,16 @@ class AiReviewEngine:
         statement = select(FuturesPosition).where(FuturesPosition.user_id == user_id)
         return list(self.db.scalars(statement).all())
 
-    def _save_review(self, position: FuturesPosition, review: TradeReviewOutput) -> AiTradeReview:
+    def _save_review(
+        self,
+        position: FuturesPosition,
+        review: TradeReviewOutput,
+        review_timeframe: str,
+    ) -> AiTradeReview:
         review_row = AiTradeReview(
             user_id=position.user_id,
             position_id=position.id,
-            timeframe="multi",
+            timeframe=review_timeframe,
             rule_match_score=review.rule_match_score,
             risk_score=review.risk_score,
             execution_score=review.execution_score,
@@ -236,6 +325,7 @@ class AiReviewEngine:
     def _build_review_context(
         self,
         position: FuturesPosition,
+        review_timeframe: str,
         similar_past_trade_stats: dict[str, Any] | None,
     ) -> TradeReviewInput:
         raw_snapshots = self._load_required_snapshots(position.id)
@@ -244,22 +334,29 @@ class AiReviewEngine:
             if isinstance(raw_snapshots, dict)
             else list(raw_snapshots)
         )
+        review_snapshots = [
+            snapshot for snapshot in snapshots if snapshot.timeframe == review_timeframe
+        ]
         transaction_timeline, transaction_timeline_source = PositionContextService(
             db=self.db
         ).transaction_timeline(position)
         plan_service = TradingPlanService(db=self.db)
         trading_plan = plan_service.load_active_plan(user_id=position.user_id)
+        trade_metadata = self._load_trade_metadata(position_id=position.id)
         plan_evaluation = plan_service.evaluate_position(
             plan=trading_plan,
             position=position,
-            snapshots=snapshots,
+            snapshots=review_snapshots,
             positions_for_daily_count=self._load_user_positions(position.user_id),
+            trade_metadata=trade_metadata,
         )
         return self._build_review_input(
             position=position,
-            snapshots=snapshots,
+            review_timeframe=review_timeframe,
+            snapshots=review_snapshots,
             transaction_timeline=transaction_timeline,
             transaction_timeline_source=transaction_timeline_source,
+            trade_metadata=trade_metadata,
             trading_plan=plan_service.to_review_context(trading_plan),
             plan_evaluation=plan_evaluation,
             similar_past_trade_stats=similar_past_trade_stats,
@@ -268,14 +365,17 @@ class AiReviewEngine:
     def _build_review_input(
         self,
         position: FuturesPosition,
+        review_timeframe: str,
         snapshots: list[IndicatorSnapshot],
         transaction_timeline: list[PositionTransactionRead],
         transaction_timeline_source: str,
+        trade_metadata: PositionTradeMetadata | None,
         trading_plan,
         plan_evaluation,
         similar_past_trade_stats: dict[str, Any] | None,
     ) -> TradeReviewInput:
         return TradeReviewInput(
+            review_timeframe=review_timeframe,
             position=TradeReviewPositionInput(
                 symbol=position.symbol,
                 direction=position.direction,
@@ -298,12 +398,18 @@ class AiReviewEngine:
                         else 99,
                     ),
                 )
-                if snapshot.timeframe in REQUIRED_REVIEW_TIMEFRAMES
+                if snapshot.timeframe == review_timeframe
             ],
             transaction_timeline=transaction_timeline,
             transaction_timeline_source=transaction_timeline_source,
+            trade_metadata=(
+                PositionTradeMetadataRead.model_validate(trade_metadata)
+                if trade_metadata is not None
+                else None
+            ),
             trading_plan=trading_plan,
             plan_evaluation=plan_evaluation,
+            rule_evidence=self._rule_evidence(plan_evaluation),
             user_rules=None,
             similar_past_trade_stats=self._sanitize_payload(similar_past_trade_stats),
         )
@@ -326,19 +432,60 @@ class AiReviewEngine:
             atr_14=snapshot.atr_14,
             volume_relative=snapshot.volume_relative,
             trend_label=snapshot.trend_label,
+            candlestick_patterns=list(getattr(snapshot, "candlestick_patterns", []) or []),
         )
 
+    def _rule_evidence(self, plan_evaluation) -> list[dict[str, Any]]:
+        if plan_evaluation is None:
+            return []
+        return [
+            {
+                "title": item.title,
+                "rule_type": item.rule_type,
+                "status": item.status,
+                "message": item.message,
+                "timeframe": item.timeframe,
+                "anchor": item.anchor,
+                "expected": item.expected,
+                "observed": item.observed,
+                "evidence": item.evidence,
+            }
+            for item in plan_evaluation.items
+            if item.status in {"failed", "unknown"}
+        ]
+
     def _build_question_context(self, position: FuturesPosition) -> dict[str, Any]:
+        latest_review = self._load_latest_review(position_id=position.id)
+        review_timeframe = self._latest_review_timeframe(latest_review)
         review_input = self._build_review_context(
             position=position,
+            review_timeframe=review_timeframe,
             similar_past_trade_stats=None,
         )
-        latest_review = self._load_latest_review(position_id=position.id)
         context = review_input.model_dump(mode="json")
         context["latest_review"] = (
             latest_review.review_json if latest_review is not None else None
         )
+        context["latest_review_timeframe"] = review_timeframe
         return self._sanitize_payload(context)
+
+    def _load_trade_metadata(self, position_id: UUID) -> PositionTradeMetadata | None:
+        if not hasattr(self.db, "scalar"):
+            metadata_rows = getattr(self.db, "trade_metadata", [])
+            return next(
+                (
+                    metadata
+                    for metadata in metadata_rows
+                    if getattr(metadata, "position_id", None) == position_id
+                ),
+                None,
+            )
+        statement = (
+            select(PositionTradeMetadata)
+            .where(PositionTradeMetadata.position_id == position_id)
+            .limit(1)
+        )
+        return self.db.scalar(statement)
 
     def _load_latest_review(self, position_id: UUID) -> AiTradeReview | None:
         if not hasattr(self.db, "scalar"):
@@ -364,6 +511,8 @@ class AiReviewEngine:
         self,
         review_input: TradeReviewInput,
     ) -> TradeReviewOutput:
+        last_error: Exception | None = None
+        last_failure_message: str | None = None
         for attempt in range(2):
             try:
                 raw_review = await self._request_llm_review(
@@ -371,12 +520,36 @@ class AiReviewEngine:
                     strict_retry=attempt > 0,
                 )
                 review = TradeReviewOutput.model_validate(raw_review)
-                if not self.contains_forbidden_phrase(review):
-                    return review
-            except (httpx.HTTPError, KeyError, TypeError, ValueError, ValidationError):
+                if self.contains_forbidden_phrase(review):
+                    last_failure_message = "AI review failed safety checks."
+                    continue
+                return review
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                last_failure_message = self._llm_generation_failure_message(exc)
+                if 400 <= exc.response.status_code < 500:
+                    break
+            except (httpx.HTTPError, KeyError, TypeError, ValueError, ValidationError) as exc:
+                last_error = exc
+                last_failure_message = self._llm_generation_failure_message(exc)
                 continue
 
-        return self._fallback_review(review_input=review_input, missing_timeframes=[])
+        error = TradeReviewError(
+            last_failure_message or "AI review could not be generated."
+        )
+        if last_error is not None:
+            raise error from last_error
+        raise error
+
+    @staticmethod
+    def _llm_generation_failure_message(exc: Exception) -> str:
+        if isinstance(exc, httpx.HTTPStatusError):
+            return "OpenAI rejected the review request."
+        if isinstance(exc, httpx.HTTPError):
+            return "OpenAI review request failed."
+        if isinstance(exc, (KeyError, TypeError, ValueError, ValidationError)):
+            return "AI returned unreadable review data."
+        return "AI review could not be generated."
 
     async def _request_llm_review(
         self,
@@ -422,7 +595,19 @@ class AiReviewEngine:
         system_prompt = (
             "You are an educational trade-review assistant for completed MEXC Futures "
             "positions. You are not a signal bot. Ground the review in the stored "
-            "transaction timestamps, entry/exit indicator snapshots, and user rules. "
+            "transaction timestamps, indicator snapshots, and saved trading plan rules. "
+            "The trade timeframe is review_timeframe. The supplied indicator snapshots "
+            "are limited to that timeframe. Judge indicator criteria against that "
+            "timeframe unless a saved rule explicitly names another timeframe. "
+            "Judge only the rules under trading_plan.items. Return one "
+            "trading_plan_rule_results item for each saved rule, in the same order. "
+            "Use status followed only when the provided context clearly shows the rule "
+            "was followed. Use status not_followed when evidence is missing, unclear, "
+            "or the rule was broken. Do not create, rename, or skip rules. "
+            "Do not add generic strengths, weaknesses, indicator commentary, or candle "
+            "analysis unless it directly explains a saved rule result. "
+            "Use short plain ASCII sentences. Do not use markdown, bullets, emojis, "
+            "underscores, semicolons, or technical field names in user-facing text. "
             "Do not instruct the user to buy, sell, short, long, or enter. "
             "Never claim guarantees. The final decision belongs to the user."
         )
@@ -453,7 +638,7 @@ class AiReviewEngine:
                 "format": {
                     "type": "json_schema",
                     "name": "trade_review_output",
-                    "schema": TradeReviewOutput.model_json_schema(),
+                    "schema": trade_review_output_openai_schema(),
                     "strict": True,
                 }
             },
@@ -474,7 +659,10 @@ class AiReviewEngine:
                                 "reconstructed MEXC Futures positions. Use only the provided "
                                 "transaction timeline, position data, indicator snapshots, AI "
                                 "review, and trading plan. Do not give direct trading "
-                                "instructions or financial advice."
+                                "instructions or financial advice. Keep answers short and easy "
+                                "to understand. Use plain ASCII sentences. Do not use markdown, "
+                                "bullets, emojis, underscores, semicolons, or technical field "
+                                "names."
                             ),
                         }
                     ],
@@ -524,72 +712,233 @@ class AiReviewEngine:
             return answer
         raise ValueError("OpenAI response did not include text output.")
 
+    def _normalize_review_timeframe(self, timeframe: str | None) -> str:
+        normalized = timeframe or DEFAULT_REVIEW_TIMEFRAME
+        if normalized not in REQUIRED_REVIEW_TIMEFRAMES:
+            raise ReviewContextMissingError(f"Unsupported review timeframe: {normalized}")
+        return normalized
+
+    def _latest_review_timeframe(self, latest_review: AiTradeReview | None) -> str:
+        if latest_review is not None and latest_review.timeframe in REQUIRED_REVIEW_TIMEFRAMES:
+            return latest_review.timeframe
+        return DEFAULT_REVIEW_TIMEFRAME
+
+    def _ensure_review_timeframe_snapshot(self, review_input: TradeReviewInput) -> None:
+        entry_snapshots = self._entry_snapshots_by_timeframe(review_input.indicator_snapshots)
+        if review_input.review_timeframe in entry_snapshots:
+            return
+        label = TIMEFRAME_LABELS.get(review_input.review_timeframe, review_input.review_timeframe)
+        raise ReviewContextMissingError(
+            f"Prepare the {label} entry snapshot before generating an AI review."
+        )
+
     def _fallback_review(
         self,
         review_input: TradeReviewInput,
         missing_timeframes: list[str],
     ) -> TradeReviewOutput:
-        entry_snapshots = [
-            snapshot
-            for snapshot in review_input.indicator_snapshots
-            if snapshot.anchor == "entry"
-        ]
-        snapshot_by_timeframe = {
-            snapshot.timeframe: snapshot for snapshot in review_input.indicator_snapshots
-            if snapshot.anchor == "entry"
-        }
-        timeframe_alignment = self._fallback_timeframe_alignment(snapshot_by_timeframe)
-        observations = self._fallback_indicator_observations(snapshot_by_timeframe)
-        risk_flags = [
-            f"Missing {TIMEFRAME_LABELS[timeframe]} indicator snapshot."
-            for timeframe in missing_timeframes
-        ]
-        risk_flags.extend(self._indicator_risk_flags(snapshot_by_timeframe, review_input.position))
-        direction = review_input.position.direction
-        strengths = self._fallback_strengths(snapshot_by_timeframe, direction)
-        weaknesses = self._fallback_weaknesses(snapshot_by_timeframe, direction)
-        mistake_tags = self._fallback_mistake_tags(risk_flags=risk_flags, weaknesses=weaknesses)
-
-        summary = (
-            f"Educational review for the completed {review_input.position.direction} "
-            f"{review_input.position.symbol} position. The multi-timeframe context was "
-            f"{timeframe_alignment.overall}, with realized PnL of "
-            f"{review_input.position.realized_pnl} before review interpretation."
-        )
+        _ = missing_timeframes
+        rule_results = self._fallback_rule_results(review_input)
+        not_followed_rules = self._not_followed_rule_lines(rule_results)
+        score = self._rule_results_score(rule_results)
 
         return TradeReviewOutput(
-            summary=summary,
-            timeframe_alignment=timeframe_alignment,
-            indicator_observations=observations,
-            strengths=strengths,
-            weaknesses=weaknesses,
-            risk_flags=risk_flags,
-            mistake_tags=mistake_tags,
-            rule_match_score=self._rule_match_score(review_input),
-            risk_score=max(0, 100 - (len(risk_flags) * 15)),
-            execution_score=70 if review_input.position.status == "closed" else 50,
-            final_note=(
-                "Final decision belongs to the user. "
-                "This review is educational and retrospective."
-            ),
-            transaction_timeline=self._fallback_transaction_timeline(review_input),
-            entry_analysis=self._fallback_anchor_analysis(entry_snapshots, "entry"),
-            exit_analysis=self._fallback_anchor_analysis(
-                [
-                    snapshot
-                    for snapshot in review_input.indicator_snapshots
-                    if snapshot.anchor == "exit"
-                ],
-                "exit",
-            ),
-            plan_compliance=self._fallback_plan_compliance(review_input),
-            execution_notes=self._fallback_execution_notes(review_input),
-            missed_context=risk_flags or ["No deterministic missed context was identified."],
-            follow_up_questions=[
-                "Which plan item was hardest to satisfy for this position?",
-                "How did transaction timing compare with the stored indicator context?",
-            ],
+            summary=self._rule_summary(score=score, total_rules=len(rule_results)),
+            timeframe_alignment=self._empty_timeframe_alignment(),
+            indicator_observations=self._empty_indicator_observations(),
+            strengths=[],
+            weaknesses=not_followed_rules,
+            risk_flags=[],
+            mistake_tags=[],
+            rule_match_score=score,
+            risk_score=None,
+            execution_score=None,
+            final_note="This review is educational and retrospective.",
+            transaction_timeline=[],
+            entry_analysis=[],
+            exit_analysis=[],
+            plan_compliance=not_followed_rules,
+            execution_notes=[],
+            missed_context=[],
+            follow_up_questions=[],
+            abandoned_rules=not_followed_rules,
+            rule_violations=not_followed_rules,
+            trading_plan_rule_results=rule_results,
         )
+
+    def _enforce_rule_only_review(
+        self,
+        review: TradeReviewOutput,
+        review_input: TradeReviewInput,
+    ) -> TradeReviewOutput:
+        rule_results = self._normalize_rule_results(
+            raw_results=review.trading_plan_rule_results,
+            review_input=review_input,
+        )
+        not_followed_rules = self._not_followed_rule_lines(rule_results)
+        score = self._rule_results_score(rule_results)
+        review.timeframe_alignment = self._empty_timeframe_alignment()
+        review.indicator_observations = self._empty_indicator_observations()
+        review.strengths = []
+        review.weaknesses = not_followed_rules
+        review.risk_flags = []
+        review.mistake_tags = []
+        review.rule_match_score = score
+        review.risk_score = None
+        review.execution_score = None
+        review.transaction_timeline = []
+        review.entry_analysis = []
+        review.exit_analysis = []
+        review.plan_compliance = not_followed_rules
+        review.execution_notes = []
+        review.missed_context = []
+        review.follow_up_questions = []
+        review.abandoned_rules = not_followed_rules
+        review.rule_violations = not_followed_rules
+        review.trading_plan_rule_results = rule_results
+        review.summary = self._rule_summary(score=score, total_rules=len(rule_results))
+        review.final_note = "This review is educational and retrospective."
+        return review
+
+    @staticmethod
+    def _empty_timeframe_alignment() -> TimeframeAlignment:
+        return TimeframeAlignment(
+            one_hour="not reviewed",
+            four_hour="not reviewed",
+            one_day="not reviewed",
+            overall="rule-only",
+        )
+
+    @staticmethod
+    def _empty_indicator_observations() -> IndicatorObservations:
+        return IndicatorObservations(rsi=[], stoch_rsi=[], macd=[], supertrend=[])
+
+    @staticmethod
+    def _rule_only_mistake_tags(
+        failed_rules: list[str],
+        unknown_rules: list[str],
+    ) -> list[str]:
+        tags: list[str] = []
+        if failed_rules:
+            tags.append("trading_plan_rule_abandoned")
+        if unknown_rules:
+            tags.append("trading_plan_rule_unknown")
+        return tags
+
+    @staticmethod
+    def _rule_only_follow_up_questions(abandoned_rules: list[str]) -> list[str]:
+        if not abandoned_rules:
+            return []
+        return ["Which failed or unknown rule needs clearer evidence before the next review?"]
+
+    def _active_plan_rules(self, review_input: TradeReviewInput) -> list[dict[str, Any]]:
+        if review_input.trading_plan is not None:
+            return [
+                {
+                    "title": item.title,
+                    "description": item.description,
+                    "sort_order": item.sort_order,
+                    "fallback_reason": None,
+                }
+                for item in sorted(
+                    review_input.trading_plan.items,
+                    key=lambda item: item.sort_order,
+                )
+                if item.enabled
+            ]
+
+        evaluation = review_input.plan_evaluation
+        if evaluation is None:
+            return []
+        return [
+            {
+                "title": item.title,
+                "description": item.description,
+                "sort_order": item.sort_order,
+                "fallback_reason": item.message
+                if item.status in {"failed", "unknown"}
+                else None,
+            }
+            for item in sorted(evaluation.items, key=lambda item: item.sort_order)
+        ]
+
+    def _fallback_rule_results(
+        self,
+        review_input: TradeReviewInput,
+    ) -> list[TradingPlanRuleResult]:
+        return [
+            TradingPlanRuleResult(
+                title=str(rule["title"]),
+                status="not_followed",
+                reason=self._plain_text(
+                    str(
+                        rule.get("fallback_reason")
+                        or "Stored evidence did not prove this rule was followed."
+                    ),
+                    fallback="Stored evidence did not prove this rule was followed.",
+                ),
+            )
+            for rule in self._active_plan_rules(review_input)
+        ]
+
+    def _normalize_rule_results(
+        self,
+        raw_results: list[TradingPlanRuleResult],
+        review_input: TradeReviewInput,
+    ) -> list[TradingPlanRuleResult]:
+        rules = self._active_plan_rules(review_input)
+        normalized: list[TradingPlanRuleResult] = []
+        for index, rule in enumerate(rules):
+            raw_result = raw_results[index] if index < len(raw_results) else None
+            status = (
+                raw_result.status
+                if raw_result is not None and raw_result.status == "followed"
+                else "not_followed"
+            )
+            reason = (
+                raw_result.reason
+                if raw_result is not None and raw_result.reason.strip()
+                else "Stored evidence did not prove this rule was followed."
+            )
+            normalized.append(
+                TradingPlanRuleResult(
+                    title=str(rule["title"]),
+                    status=status,
+                    reason=self._plain_text(
+                        reason,
+                        fallback="Stored evidence did not prove this rule was followed.",
+                    ),
+                )
+            )
+        return normalized
+
+    @staticmethod
+    def _rule_results_score(rule_results: list[TradingPlanRuleResult]) -> int | None:
+        if not rule_results:
+            return None
+        followed_count = len(
+            [result for result in rule_results if result.status == "followed"]
+        )
+        return int((followed_count / len(rule_results)) * 100)
+
+    def _not_followed_rule_lines(
+        self,
+        rule_results: list[TradingPlanRuleResult],
+    ) -> list[str]:
+        return [
+            self._plain_text(
+                f"{result.title}. {result.reason}",
+                fallback=result.title,
+            )
+            for result in rule_results
+            if result.status == "not_followed"
+        ]
+
+    @staticmethod
+    def _rule_summary(score: int | None, total_rules: int) -> str:
+        if total_rules == 0 or score is None:
+            return "No saved trading plan rules were available."
+        return f"{score} percent of saved trading plan rules were followed."
 
     def _fallback_timeframe_alignment(
         self,
@@ -754,6 +1103,17 @@ class AiReviewEngine:
         return [
             f"{item.title}: {item.status} - {item.message}"
             for item in evaluation.items
+            if item.status in {"failed", "unknown"}
+        ]
+
+    def _abandoned_rule_lines(self, review_input: TradeReviewInput) -> list[str]:
+        evaluation = review_input.plan_evaluation
+        if evaluation is None:
+            return []
+        return [
+            f"{item.title}: {item.status} - {item.message}"
+            for item in evaluation.items
+            if item.status in {"failed", "unknown"}
         ]
 
     def _fallback_execution_notes(self, review_input: TradeReviewInput) -> list[str]:
@@ -838,6 +1198,80 @@ class AiReviewEngine:
         if isinstance(value, list):
             return [self._sanitize_payload(item) for item in value]
         return value
+
+    def _sanitize_review_text(self, review: TradeReviewOutput) -> TradeReviewOutput:
+        review.summary = self._plain_text(review.summary, fallback="Review complete.")
+        review.final_note = self._plain_text(
+            review.final_note,
+            fallback="This review is educational and retrospective.",
+        )
+        review.strengths = [self._plain_text(item, fallback="") for item in review.strengths]
+        review.weaknesses = [self._plain_text(item, fallback="") for item in review.weaknesses]
+        review.risk_flags = [self._plain_text(item, fallback="") for item in review.risk_flags]
+        review.transaction_timeline = [
+            self._plain_text(item, fallback="") for item in review.transaction_timeline
+        ]
+        review.entry_analysis = [
+            self._plain_text(item, fallback="") for item in review.entry_analysis
+        ]
+        review.exit_analysis = [
+            self._plain_text(item, fallback="") for item in review.exit_analysis
+        ]
+        review.plan_compliance = [
+            self._plain_text(item, fallback="") for item in review.plan_compliance
+        ]
+        review.execution_notes = [
+            self._plain_text(item, fallback="") for item in review.execution_notes
+        ]
+        review.missed_context = [
+            self._plain_text(item, fallback="") for item in review.missed_context
+        ]
+        review.follow_up_questions = [
+            self._plain_text(item, fallback="") for item in review.follow_up_questions
+        ]
+        review.abandoned_rules = [
+            self._plain_text(item, fallback="") for item in review.abandoned_rules
+        ]
+        review.rule_violations = [
+            self._plain_text(item, fallback="") for item in review.rule_violations
+        ]
+        review.trading_plan_rule_results = [
+            TradingPlanRuleResult(
+                title=result.title,
+                status=result.status,
+                reason=self._plain_text(
+                    result.reason,
+                    fallback="Stored evidence did not prove this rule was followed.",
+                ),
+            )
+            for result in review.trading_plan_rule_results
+        ]
+        return review
+
+    @staticmethod
+    def _plain_text(value: str, fallback: str, max_length: int = 220) -> str:
+        text = value.encode("ascii", errors="ignore").decode("ascii")
+        text = text.replace("_", " ").replace(";", ".")
+        replacements = {
+            "Min60": "1 hour",
+            "Hour4": "4 hour",
+            "Day1": "1 day",
+            "rsi 14": "RSI",
+            " lt ": " less than ",
+            " lte ": " less than or equal to ",
+            " gt ": " greater than ",
+            " gte ": " greater than or equal to ",
+            " eq ": " equal to ",
+        }
+        for source, replacement in replacements.items():
+            text = re.sub(re.escape(source), replacement, text, flags=re.IGNORECASE)
+        text = re.sub(r"(?m)^\s*[-*#]+\s*", "", text)
+        text = re.sub(r"[`*_#>{}\[\]|~^]+", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > max_length:
+            text = text[:max_length].rsplit(" ", 1)[0].rstrip(" .")
+            text = f"{text}."
+        return text or fallback
 
     @classmethod
     def contains_forbidden_phrase(cls, value: TradeReviewOutput | dict[str, Any] | str) -> bool:

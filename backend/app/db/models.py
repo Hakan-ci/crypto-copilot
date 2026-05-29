@@ -212,6 +212,11 @@ class FuturesPosition(Base):
         back_populates="position",
         cascade="all, delete-orphan",
     )
+    trade_metadata: Mapped["PositionTradeMetadata | None"] = relationship(
+        back_populates="position",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
 
 
 class Candle(Base):
@@ -283,6 +288,12 @@ class IndicatorSnapshot(Base):
     atr_14: Mapped[Decimal | None] = mapped_column(INDICATOR_NUMERIC)
     volume_relative: Mapped[Decimal | None] = mapped_column(INDICATOR_NUMERIC)
     trend_label: Mapped[str | None] = mapped_column(String(64))
+    candlestick_patterns: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+    )
 
     position: Mapped["FuturesPosition"] = relationship(back_populates="indicator_snapshots")
 
@@ -394,6 +405,37 @@ class AiTradeQuestion(Base):
 
     user: Mapped["User"] = relationship(back_populates="ai_trade_questions")
     position: Mapped["FuturesPosition"] = relationship(back_populates="ai_trade_questions")
+
+
+class PositionTradeMetadata(Base):
+    __tablename__ = "position_trade_metadata"
+    __table_args__ = (
+        UniqueConstraint("position_id", name="uq_position_trade_metadata_position_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
+    position_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("futures_positions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    planned_stop_loss_price: Mapped[Decimal | None] = mapped_column(PRICE_NUMERIC)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+        server_default=func.now(),
+    )
+
+    position: Mapped["FuturesPosition"] = relationship(back_populates="trade_metadata")
 
 
 class CryptoBasket(Base):

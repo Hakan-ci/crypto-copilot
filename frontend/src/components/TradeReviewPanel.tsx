@@ -3,8 +3,15 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Sparkles } from "lucide-react";
 
+import { TimeframeSelector } from "@/components/TimeframeSelector";
 import { generateReview } from "@/lib/api";
-import type { AiTradeReview, TradeReviewOutput } from "@/lib/types";
+import { timeframeLabel } from "@/lib/timeframes";
+import type {
+  AiTradeReview,
+  Timeframe,
+  TradeReviewOutput,
+  TradingPlanRuleResult
+} from "@/lib/types";
 
 function readReview(review: AiTradeReview | null): TradeReviewOutput | null {
   if (!review) {
@@ -42,27 +49,65 @@ function readReview(review: AiTradeReview | null): TradeReviewOutput | null {
     plan_compliance: [],
     execution_notes: [],
     missed_context: [],
-    follow_up_questions: []
+    follow_up_questions: [],
+    abandoned_rules: [],
+    rule_violations: [],
+    trading_plan_rule_results: []
   };
+}
+
+function notFollowedRules(reviewOutput: TradeReviewOutput | null): TradingPlanRuleResult[] {
+  if (!reviewOutput) {
+    return [];
+  }
+  const structuredResults = reviewOutput.trading_plan_rule_results ?? [];
+  if (structuredResults.length > 0) {
+    return structuredResults.filter((result) => result.status === "not_followed");
+  }
+
+  const legacyRules =
+    reviewOutput.rule_violations?.length
+      ? reviewOutput.rule_violations
+      : reviewOutput.abandoned_rules ?? [];
+  return legacyRules.map((ruleLine) => {
+    const [titlePart, detailPart] = ruleLine.split(":");
+    const reason = detailPart?.includes(" - ")
+      ? detailPart.split(" - ").slice(1).join(" - ").trim()
+      : (detailPart ?? ruleLine).trim();
+    return {
+      title: titlePart?.trim() || "Trading plan rule",
+      status: "not_followed",
+      reason: reason || "This rule was not followed."
+    };
+  });
 }
 
 export function TradeReviewPanel({
   positionId,
   review,
-  snapshotsReady
+  snapshotsReady,
+  reviewTimeframe,
+  onReviewTimeframeChange
 }: {
   positionId: string;
   review: AiTradeReview | null;
   snapshotsReady: boolean;
+  reviewTimeframe: Timeframe;
+  onReviewTimeframeChange: (value: Timeframe) => void;
 }) {
   const queryClient = useQueryClient();
   const mutation = useMutation({
-    mutationFn: () => generateReview(positionId),
+    mutationFn: () => generateReview(positionId, reviewTimeframe),
     onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["position-detail", positionId] });
+    },
+    onError: () => {
       void queryClient.invalidateQueries({ queryKey: ["position-detail", positionId] });
     }
   });
   const reviewOutput = mutation.data?.review ?? readReview(review);
+  const rulesNotFollowed = notFollowedRules(reviewOutput);
+  const ruleScore = reviewOutput?.rule_match_score;
 
   return (
     <section className="rounded-md border border-stone-200 bg-white p-4 shadow-soft">
@@ -70,68 +115,59 @@ export function TradeReviewPanel({
         <div>
           <h2 className="text-lg font-semibold text-slate-950">AI trade review</h2>
           <p className="mt-1 text-sm text-slate-600">
-            Educational review of this completed position and its stored indicators.
+            Saved trading plan rule compliance.
           </p>
         </div>
-        <button
-          className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-slate-900 px-4 text-sm font-medium text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
-          type="button"
-          disabled={mutation.isPending || !snapshotsReady}
-          onClick={() => mutation.mutate()}
-        >
-          <Sparkles className="h-4 w-4" aria-hidden="true" />
-          {mutation.isPending ? "Generating..." : "Generate Review"}
-        </button>
+        <div className="flex flex-col gap-2 sm:items-end">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium text-slate-700">Trade timeframe</span>
+            <TimeframeSelector
+              value={reviewTimeframe}
+              onChange={(value) => {
+                if (value !== "all") {
+                  onReviewTimeframeChange(value);
+                }
+              }}
+            />
+          </div>
+          <button
+            className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-slate-900 px-4 text-sm font-medium text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
+            type="button"
+            disabled={mutation.isPending || !snapshotsReady}
+            onClick={() => mutation.mutate()}
+          >
+            <Sparkles className="h-4 w-4" aria-hidden="true" />
+            {mutation.isPending ? "Generating..." : "Generate Review"}
+          </button>
+        </div>
       </div>
       {mutation.isError ? (
         <p className="mt-3 text-sm text-red-700">{(mutation.error as Error).message}</p>
       ) : null}
       {!snapshotsReady ? (
         <p className="mt-3 text-sm text-amber-700">
-          Prepare 1H, 4H, and 1D snapshots before generating an AI review.
+          Prepare the {timeframeLabel(reviewTimeframe)} entry snapshot before generating an AI review.
         </p>
       ) : null}
       {reviewOutput ? (
         <div className="mt-4 space-y-4">
-          <p className="text-sm leading-6 text-slate-700">{reviewOutput.summary}</p>
-          <div className="grid gap-3 md:grid-cols-3">
-            {[
-              ["Rule match", reviewOutput.rule_match_score],
-              ["Risk", reviewOutput.risk_score],
-              ["Execution", reviewOutput.execution_score]
-            ].map(([label, score]) => (
-              <div key={label} className="rounded-md border border-stone-200 bg-stone-50 px-3 py-2">
-                <p className="text-xs font-medium uppercase tracking-[0.12em] text-slate-500">
-                  {label}
-                </p>
-                <p className="mt-1 text-lg font-semibold text-slate-950">{score ?? "-"}</p>
-              </div>
-            ))}
+          <div className="rounded-md border border-stone-200 bg-stone-50 px-3 py-2">
+            <p className="text-xs font-medium uppercase tracking-[0.12em] text-slate-500">
+              Rules followed
+            </p>
+            <p className="mt-1 text-lg font-semibold text-slate-950">
+              {typeof ruleScore === "number" ? `${ruleScore}%` : "-"}
+            </p>
           </div>
-          <div className="grid gap-4 lg:grid-cols-2">
-            <ReviewList title="Strengths" items={reviewOutput.strengths} />
-            <ReviewList title="Weaknesses" items={reviewOutput.weaknesses} />
-            <ReviewList title="Risk flags" items={reviewOutput.risk_flags} />
-            <ReviewList title="Mistake tags" items={reviewOutput.mistake_tags} />
-          </div>
-          <div className="grid gap-4 lg:grid-cols-2">
-            <ReviewList
-              title="Transaction timing"
-              items={reviewOutput.transaction_timeline ?? []}
-            />
-            <ReviewList title="Plan compliance" items={reviewOutput.plan_compliance ?? []} />
-            <ReviewList title="Entry analysis" items={reviewOutput.entry_analysis ?? []} />
-            <ReviewList title="Exit analysis" items={reviewOutput.exit_analysis ?? []} />
-            <ReviewList title="Execution notes" items={reviewOutput.execution_notes ?? []} />
-            <ReviewList title="Missed context" items={reviewOutput.missed_context ?? []} />
-          </div>
-          <ReviewList
-            title="Follow-up questions"
-            items={reviewOutput.follow_up_questions ?? []}
-          />
-          <p className="rounded-md bg-stone-50 px-3 py-2 text-sm text-slate-700">
-            {reviewOutput.final_note}
-          </p>
+          {rulesNotFollowed.length > 0 ? (
+            <NotFollowedRules items={rulesNotFollowed} />
+          ) : (
+            <p className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+              {typeof ruleScore === "number"
+                ? "All saved trading plan rules were followed."
+                : "No saved trading plan rules were available."}
+            </p>
+          )}
         </div>
       ) : (
         <p className="mt-4 text-sm text-slate-600">
@@ -142,19 +178,25 @@ export function TradeReviewPanel({
   );
 }
 
-function ReviewList({ title, items }: { title: string; items: string[] }) {
+function NotFollowedRules({
+  items
+}: {
+  items: TradingPlanRuleResult[];
+}) {
   return (
     <div>
-      <h3 className="text-sm font-semibold text-slate-950">{title}</h3>
-      {items.length === 0 ? (
-        <p className="mt-1 text-sm text-slate-500">No items yet.</p>
-      ) : (
-        <ul className="mt-2 space-y-1 text-sm text-slate-700">
-          {items.map((item) => (
-            <li key={item}>{item}</li>
-          ))}
-        </ul>
-      )}
+      <h3 className="text-sm font-semibold text-slate-950">Rules not followed</h3>
+      <div className="mt-2 grid gap-2">
+        {items.map((item, index) => (
+          <article
+            key={`${item.title}-${index}`}
+            className="rounded-md border border-red-100 bg-red-50 px-3 py-2"
+          >
+            <h4 className="text-sm font-semibold text-red-900">{item.title}</h4>
+            <p className="mt-1 text-sm leading-6 text-red-800">{item.reason}</p>
+          </article>
+        ))}
+      </div>
     </div>
   );
 }

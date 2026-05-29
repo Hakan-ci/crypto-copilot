@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.constants import SUPPORTED_TIMEFRAMES
-from app.db.models import AiTradeReview, FuturesPosition, IndicatorSnapshot
+from app.db.models import AiTradeReview, FuturesPosition, IndicatorSnapshot, PositionTradeMetadata
 from app.schemas.indicators import IndicatorSnapshotRead
 from app.schemas.trades import (
     AiTradeReviewRead,
@@ -15,6 +15,7 @@ from app.schemas.trades import (
     IndicatorSummary,
     PositionDetail,
     PositionListItem,
+    PositionTradeMetadataRead,
     SymbolPerformance,
 )
 from app.services.position_context import PositionContextService
@@ -173,11 +174,13 @@ class RiskEngine:
         ).transaction_timeline(position)
         plan_service = TradingPlanService(db=self.db)
         plan = plan_service.load_active_plan(user_id=position.user_id)
+        trade_metadata = self._load_trade_metadata(position_id=position.id)
         plan_evaluation = plan_service.evaluate_position(
             plan=plan,
             position=position,
             snapshots=snapshots,
             positions_for_daily_count=self._load_user_positions(user_id=position.user_id),
+            trade_metadata=trade_metadata,
         )
 
         return PositionDetail(
@@ -187,6 +190,11 @@ class RiskEngine:
             ],
             ai_review=AiTradeReviewRead.model_validate(review) if review else None,
             plan_evaluation=plan_evaluation,
+            trade_metadata=(
+                PositionTradeMetadataRead.model_validate(trade_metadata)
+                if trade_metadata is not None
+                else None
+            ),
             transaction_timeline=transaction_timeline,
             transaction_timeline_source=transaction_timeline_source,
         )
@@ -229,6 +237,24 @@ class RiskEngine:
             select(AiTradeReview)
             .where(AiTradeReview.position_id == position_id)
             .order_by(AiTradeReview.created_at.desc())
+            .limit(1)
+        )
+        return self.db.scalar(statement)
+
+    def _load_trade_metadata(self, position_id: UUID) -> PositionTradeMetadata | None:
+        if not hasattr(self.db, "scalar"):
+            metadata_rows = getattr(self.db, "trade_metadata", [])
+            return next(
+                (
+                    metadata
+                    for metadata in metadata_rows
+                    if getattr(metadata, "position_id", None) == position_id
+                ),
+                None,
+            )
+        statement = (
+            select(PositionTradeMetadata)
+            .where(PositionTradeMetadata.position_id == position_id)
             .limit(1)
         )
         return self.db.scalar(statement)

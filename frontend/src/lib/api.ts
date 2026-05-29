@@ -13,7 +13,10 @@ import type {
   Position,
   PositionDetail,
   PositionFilters,
+  PositionTradeMetadata,
+  PositionTradeMetadataUpsert,
   Timeframe,
+  TradeReviewRequest,
   TradingPlan,
   TradingPlanUpsert,
   TradeReviewResponse,
@@ -88,6 +91,20 @@ export function getPositionDetail(positionId: string) {
   return request<PositionDetail>(`/positions/${positionId}`);
 }
 
+export function getPositionTradeMetadata(positionId: string) {
+  return request<PositionTradeMetadata | null>(`/positions/${positionId}/trade-metadata`);
+}
+
+export function putPositionTradeMetadata(
+  positionId: string,
+  payload: PositionTradeMetadataUpsert
+) {
+  return request<PositionTradeMetadata>(`/positions/${positionId}/trade-metadata`, {
+    method: "PUT",
+    body: JSON.stringify(payload)
+  });
+}
+
 export function getTradingPlan(userId: string) {
   return request<TradingPlan>(`/users/${userId}/trading-plan`);
 }
@@ -149,10 +166,11 @@ export function calculateIndicatorSnapshots(positionId: string, timeframes: Time
   );
 }
 
-export function generateReview(positionId: string) {
+export function generateReview(positionId: string, reviewTimeframe: Timeframe) {
+  const payload: TradeReviewRequest = { review_timeframe: reviewTimeframe };
   return request<TradeReviewResponse>(`/positions/${positionId}/review`, {
     method: "POST",
-    body: JSON.stringify({})
+    body: JSON.stringify(payload)
   });
 }
 

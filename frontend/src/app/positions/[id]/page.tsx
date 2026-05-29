@@ -8,11 +8,10 @@ import { useMemo, useState } from "react";
 import { CandlestickChart, type ChartCandle } from "@/components/CandlestickChart";
 import { AiQuestionPanel } from "@/components/AiQuestionPanel";
 import { EmptyState } from "@/components/EmptyState";
-import { IndicatorSnapshotPanel } from "@/components/IndicatorSnapshotPanel";
 import { MetricCard } from "@/components/MetricCard";
 import { RiskWarnings } from "@/components/RiskWarnings";
+import { StopLossMetadataPanel } from "@/components/StopLossMetadataPanel";
 import { TimeframeSelector } from "@/components/TimeframeSelector";
-import { TradingPlanEvaluationPanel } from "@/components/TradingPlanEvaluationPanel";
 import { TransactionTimelinePanel } from "@/components/TransactionTimelinePanel";
 import { TradeReviewPanel } from "@/components/TradeReviewPanel";
 import { calculateIndicatorSnapshots, getPositionDetail, listPositionCandles } from "@/lib/api";
@@ -23,8 +22,8 @@ import type { Timeframe } from "@/lib/types";
 export default function PositionDetailPage() {
   const params = useParams<{ id: string }>();
   const positionId = params.id;
-  const [selectedTimeframe, setSelectedTimeframe] = useState<Timeframe | "all">("all");
   const [chartTimeframe, setChartTimeframe] = useState<Timeframe>("Min60");
+  const [reviewTimeframe, setReviewTimeframe] = useState<Timeframe>("Hour4");
   const queryClient = useQueryClient();
   const detailQuery = useQuery({
     queryKey: ["position-detail", positionId],
@@ -75,12 +74,12 @@ export default function PositionDetailPage() {
   }
 
   const { position, indicator_snapshots: snapshots } = detail;
-  const visibleSnapshots =
-    selectedTimeframe === "all"
-      ? snapshots
-      : snapshots.filter((snapshot) => snapshot.timeframe === selectedTimeframe);
-  const snapshotTimeframes = new Set(snapshots.map((snapshot) => snapshot.timeframe));
-  const snapshotsReady = TIMEFRAMES.every((timeframe) => snapshotTimeframes.has(timeframe.value));
+  const entrySnapshotTimeframes = new Set(
+    snapshots
+      .filter((snapshot) => (snapshot.anchor || "entry") === "entry")
+      .map((snapshot) => snapshot.timeframe)
+  );
+  const reviewSnapshotReady = entrySnapshotTimeframes.has(reviewTimeframe);
 
   return (
     <div className="space-y-6">
@@ -172,34 +171,14 @@ export default function PositionDetailPage() {
         source={detail.transaction_timeline_source}
       />
 
-      <TradingPlanEvaluationPanel evaluation={detail.plan_evaluation} />
-
-      <section className="space-y-3">
-        <div className="flex items-center justify-between gap-3">
-          <h2 className="text-lg font-semibold text-slate-950">Indicator snapshots</h2>
-          <TimeframeSelector
-            value={selectedTimeframe}
-            onChange={setSelectedTimeframe}
-            includeAll
-          />
-        </div>
-        {visibleSnapshots.length === 0 ? (
-          <EmptyState title="No snapshots yet">
-            Calculate snapshots after candles are stored for 1H, 4H, and 1D.
-          </EmptyState>
-        ) : (
-          <div className="grid gap-4">
-            {visibleSnapshots.map((snapshot) => (
-              <IndicatorSnapshotPanel key={snapshot.id} snapshot={snapshot} />
-            ))}
-          </div>
-        )}
-      </section>
+      <StopLossMetadataPanel metadata={detail.trade_metadata} />
 
       <TradeReviewPanel
         positionId={position.id}
         review={detail.ai_review}
-        snapshotsReady={snapshotsReady}
+        snapshotsReady={reviewSnapshotReady}
+        reviewTimeframe={reviewTimeframe}
+        onReviewTimeframeChange={setReviewTimeframe}
       />
 
       <AiQuestionPanel positionId={position.id} />

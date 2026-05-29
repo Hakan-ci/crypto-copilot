@@ -111,9 +111,19 @@ def test_import_order_deals_and_reconstruct_combines_results(monkeypatch):
                 warnings=["partial close adjusted"],
             )
 
+    class FakeTradeMetadataService:
+        def __init__(self, db):
+            self.db = db
+
+        async def sync_stop_losses_for_user_symbol(self, user_id, symbol, client):
+            assert symbol == "BTC_USDT"
+            assert client.access_key == "access-key"
+            return 1
+
     monkeypatch.setattr(mexc_routes, "MexcFuturesClient", FakeMexcClient)
     monkeypatch.setattr(mexc_routes, "MexcImporter", FakeImporter)
     monkeypatch.setattr(mexc_routes, "PositionReconstructor", FakeReconstructor)
+    monkeypatch.setattr(mexc_routes, "TradeMetadataService", FakeTradeMetadataService)
 
     response = asyncio.run(
         mexc_routes.import_order_deals_and_reconstruct(
@@ -133,4 +143,7 @@ def test_import_order_deals_and_reconstruct_combines_results(monkeypatch):
     assert response.positions_created == 1
     assert response.open_positions == 0
     assert response.closed_positions == 1
-    assert response.warnings == ["partial close adjusted"]
+    assert response.warnings == [
+        "partial close adjusted",
+        "Synced stop-loss metadata for 1 position(s).",
+    ]

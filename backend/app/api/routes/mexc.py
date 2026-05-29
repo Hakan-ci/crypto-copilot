@@ -14,6 +14,7 @@ from app.schemas.mexc import (
 from app.services.mexc_client import MexcApiError, MexcFuturesClient
 from app.services.mexc_importer import MexcImporter
 from app.services.position_reconstructor import PositionReconstructor
+from app.services.trade_metadata_service import TradeMetadataService
 
 router = APIRouter(prefix="/mexc", tags=["mexc"])
 
@@ -118,6 +119,17 @@ async def import_order_deals_and_reconstruct(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     reconstruction = reconstructor.reconstruct(user_id=request.user_id, symbol=request.symbol)
+    warnings = list(reconstruction.warnings)
+    try:
+        synced_stops = await TradeMetadataService(db=db).sync_stop_losses_for_user_symbol(
+            user_id=request.user_id,
+            symbol=request.symbol,
+            client=client,
+        )
+        if synced_stops:
+            warnings.append(f"Synced stop-loss metadata for {synced_stops} position(s).")
+    except MexcApiError as exc:
+        warnings.append(f"Stop-loss metadata could not be synced from MEXC: {exc}")
 
     return MexcImportAndReconstructResponse(
         imported=import_result.imported,
@@ -126,5 +138,5 @@ async def import_order_deals_and_reconstruct(
         positions_created=reconstruction.positions_created,
         open_positions=reconstruction.open_positions,
         closed_positions=reconstruction.closed_positions,
-        warnings=reconstruction.warnings,
+        warnings=warnings,
     )

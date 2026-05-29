@@ -15,12 +15,13 @@ dependencies = [
     "pydantic>=2.8",
     "pydantic-settings>=2.4",
     "sqlalchemy>=2.0",
-    "starlette>=0.46,<1.0",
+"starlette>=1.0.1,<2.0",
     "uvicorn[standard]>=0.30",
 ]
 
 [project.optional-dependencies]
 dev = [
+    "pip-audit>=2.10",
     "pytest>=8.0",
     "ruff>=0.6",
 ]

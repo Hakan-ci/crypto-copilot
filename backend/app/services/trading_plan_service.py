@@ -7,8 +7,16 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.time import utc_now
-from app.db.models import FuturesPosition, IndicatorSnapshot, TradingPlan, TradingPlanItem, User
+from app.db.models import (
+    FuturesPosition,
+    IndicatorSnapshot,
+    PositionTradeMetadata,
+    TradingPlan,
+    TradingPlanItem,
+    User,
+)
 from app.schemas.trading_plan import (
+    NUMERIC_INDICATOR_FIELDS,
     TradingPlanEvaluation,
     TradingPlanEvaluationItem,
     TradingPlanRead,
@@ -99,11 +107,21 @@ class TradingPlanService:
         position: FuturesPosition,
         snapshots: list[IndicatorSnapshot],
         positions_for_daily_count: list[FuturesPosition],
+        trade_metadata: PositionTradeMetadata | None = None,
     ) -> TradingPlanEvaluation:
         if plan is None:
             return self.empty_evaluation()
 
         available_timeframes = {snapshot.timeframe for snapshot in snapshots}
+        snapshot_lookup = {
+            (
+                snapshot.timeframe,
+                getattr(snapshot, "anchor", None) or "entry",
+            ): snapshot
+            for snapshot in snapshots
+        }
+        if trade_metadata is None:
+            trade_metadata = self._load_trade_metadata(position.id)
         same_day_trade_count = self._same_day_trade_count(
             position=position,
             positions=positions_for_daily_count,
@@ -113,7 +131,9 @@ class TradingPlanService:
                 item=item,
                 position=position,
                 available_timeframes=available_timeframes,
+                snapshot_lookup=snapshot_lookup,
                 same_day_trade_count=same_day_trade_count,
+                trade_metadata=trade_metadata,
             )
             for item in sorted(plan.items, key=lambda item: item.sort_order)
             if item.enabled
@@ -142,6 +162,24 @@ class TradingPlanService:
         )
         return self.db.scalars(statement).first()
 
+    def _load_trade_metadata(self, position_id: UUID) -> PositionTradeMetadata | None:
+        if not hasattr(self.db, "scalar"):
+            metadata_rows = getattr(self.db, "trade_metadata", [])
+            return next(
+                (
+                    metadata
+                    for metadata in metadata_rows
+                    if metadata.position_id == position_id
+                ),
+                None,
+            )
+        statement = (
+            select(PositionTradeMetadata)
+            .where(PositionTradeMetadata.position_id == position_id)
+            .limit(1)
+        )
+        return self.db.scalar(statement)
+
     def _ensure_user_exists(self, user_id: UUID) -> None:
         if hasattr(self.db, "get") and self.db.get(User, user_id) is None:
             raise TradingPlanUserNotFoundError(f"User not found: {user_id}")
@@ -157,11 +195,18 @@ class TradingPlanService:
         item: TradingPlanItem,
         position: FuturesPosition,
         available_timeframes: set[str],
+        snapshot_lookup: dict[tuple[str, str], IndicatorSnapshot],
         same_day_trade_count: int,
+        trade_metadata: PositionTradeMetadata | None,
     ) -> TradingPlanEvaluationItem:
         config = dict(item.config or {})
         status = "unknown"
         message = "This rule could not be evaluated from stored trade data."
+        timeframe = None
+        anchor = None
+        expected = None
+        observed = None
+        evidence: dict[str, Any] = {}
 
         if item.rule_type == "manual_check":
             status = "manual"
@@ -222,6 +267,27 @@ class TradingPlanService:
             message = "Stored positions do not include planned risk per trade yet."
         elif item.rule_type == "min_risk_reward":
             message = "Stored positions do not include planned risk/reward yet."
+        elif item.rule_type == "indicator_condition":
+            result = self._evaluate_indicator_condition(
+                config=config,
+                position=position,
+                snapshot_lookup=snapshot_lookup,
+            )
+            status, message, timeframe, anchor, expected, observed, evidence = result
+        elif item.rule_type == "candlestick_pattern":
+            result = self._evaluate_candlestick_pattern(
+                config=config,
+                position=position,
+                snapshot_lookup=snapshot_lookup,
+            )
+            status, message, timeframe, anchor, expected, observed, evidence = result
+        elif item.rule_type == "stop_loss":
+            result = self._evaluate_stop_loss(
+                config=config,
+                position=position,
+                trade_metadata=trade_metadata,
+            )
+            status, message, timeframe, anchor, expected, observed, evidence = result
 
         return TradingPlanEvaluationItem(
             item_id=item.id,
@@ -232,7 +298,328 @@ class TradingPlanService:
             rule_type=item.rule_type,
             status=status,
             message=message,
+            timeframe=timeframe,
+            anchor=anchor,
+            expected=expected,
+            observed=observed,
+            evidence=evidence,
         )
+
+    def _evaluate_indicator_condition(
+        self,
+        config: dict[str, Any],
+        position: FuturesPosition,
+        snapshot_lookup: dict[tuple[str, str], IndicatorSnapshot],
+    ) -> tuple[str, str, str | None, str | None, str | None, str | None, dict[str, Any]]:
+        timeframe = str(config.get("timeframe", ""))
+        anchor = str(config.get("anchor") or "entry")
+        indicator = str(config.get("indicator", ""))
+        operator = str(config.get("operator", ""))
+        expected_value = config.get("value")
+        expected = f"{indicator} {operator} {expected_value}"
+        evidence = self._base_rule_evidence(
+            config=config,
+            position=position,
+            timeframe=timeframe,
+            anchor=anchor,
+            expected=expected,
+        )
+
+        if not self._direction_applies(config=config, position=position):
+            return (
+                "manual",
+                f"Rule does not apply to {position.direction} positions.",
+                timeframe,
+                anchor,
+                expected,
+                None,
+                evidence | {"applies": False},
+            )
+
+        snapshot = snapshot_lookup.get((timeframe, anchor))
+        if snapshot is None:
+            return (
+                "unknown",
+                f"Missing {timeframe} {anchor} snapshot for indicator rule.",
+                timeframe,
+                anchor,
+                expected,
+                None,
+                evidence,
+            )
+
+        observed_value = getattr(snapshot, indicator, None)
+        observed = None if observed_value is None else str(observed_value)
+        evidence |= {
+            "snapshot_timestamp": snapshot.timestamp.isoformat(),
+            "observed": observed,
+            "indicator": indicator,
+            "operator": operator,
+        }
+        if observed_value is None:
+            return (
+                "unknown",
+                f"{indicator} was unavailable on the {timeframe} {anchor} snapshot.",
+                timeframe,
+                anchor,
+                expected,
+                observed,
+                evidence,
+            )
+
+        passed = self._compare_rule_value(
+            observed_value=observed_value,
+            expected_value=expected_value,
+            operator=operator,
+            numeric=indicator in NUMERIC_INDICATOR_FIELDS,
+        )
+        status = "passed" if passed else "failed"
+        message = (
+            f"{timeframe} {anchor} {indicator} observed {observed}; expected {operator} "
+            f"{expected_value}."
+        )
+        return status, message, timeframe, anchor, expected, observed, evidence
+
+    def _evaluate_candlestick_pattern(
+        self,
+        config: dict[str, Any],
+        position: FuturesPosition,
+        snapshot_lookup: dict[tuple[str, str], IndicatorSnapshot],
+    ) -> tuple[str, str, str | None, str | None, str | None, str | None, dict[str, Any]]:
+        timeframe = str(config.get("timeframe", ""))
+        anchor = str(config.get("anchor") or "entry")
+        patterns = _string_list(config, "patterns")
+        match_mode = str(config.get("match_mode") or "any")
+        expected = f"{match_mode} of {', '.join(patterns)}"
+        evidence = self._base_rule_evidence(
+            config=config,
+            position=position,
+            timeframe=timeframe,
+            anchor=anchor,
+            expected=expected,
+        )
+
+        if not self._direction_applies(config=config, position=position):
+            return (
+                "manual",
+                f"Rule does not apply to {position.direction} positions.",
+                timeframe,
+                anchor,
+                expected,
+                None,
+                evidence | {"applies": False},
+            )
+
+        snapshot = snapshot_lookup.get((timeframe, anchor))
+        if snapshot is None:
+            return (
+                "unknown",
+                f"Missing {timeframe} {anchor} snapshot for candlestick rule.",
+                timeframe,
+                anchor,
+                expected,
+                None,
+                evidence,
+            )
+
+        detected_patterns = [
+            str(pattern)
+            for pattern in (getattr(snapshot, "candlestick_patterns", None) or [])
+        ]
+        detected_set = set(detected_patterns)
+        expected_set = set(patterns)
+        passed = (
+            bool(expected_set.intersection(detected_set))
+            if match_mode == "any"
+            else expected_set.issubset(detected_set)
+        )
+        observed = ", ".join(detected_patterns) if detected_patterns else "none"
+        evidence |= {
+            "snapshot_timestamp": snapshot.timestamp.isoformat(),
+            "detected_patterns": detected_patterns,
+            "patterns": patterns,
+            "match_mode": match_mode,
+            "observed": observed,
+        }
+        status = "passed" if passed else "failed"
+        message = (
+            f"{timeframe} {anchor} candlestick patterns observed {observed}; "
+            f"expected {expected}."
+        )
+        return status, message, timeframe, anchor, expected, observed, evidence
+
+    def _evaluate_stop_loss(
+        self,
+        config: dict[str, Any],
+        position: FuturesPosition,
+        trade_metadata: PositionTradeMetadata | None,
+    ) -> tuple[str, str, str | None, str | None, str | None, str | None, dict[str, Any]]:
+        expected = "planned stop-loss recorded with valid direction"
+        max_distance = _optional_decimal(config.get("max_distance_percent"))
+        if max_distance is not None:
+            expected += f" and distance <= {max_distance}%"
+        evidence = self._base_rule_evidence(
+            config=config,
+            position=position,
+            timeframe=None,
+            anchor="entry",
+            expected=expected,
+        )
+
+        if not self._direction_applies(config=config, position=position):
+            return (
+                "manual",
+                f"Rule does not apply to {position.direction} positions.",
+                None,
+                "entry",
+                expected,
+                None,
+                evidence | {"applies": False},
+            )
+
+        stop_loss = (
+            None
+            if trade_metadata is None
+            else _optional_decimal(trade_metadata.planned_stop_loss_price)
+        )
+        if stop_loss is None:
+            return (
+                "failed",
+                "No planned stop-loss price was recorded for this position.",
+                None,
+                "entry",
+                expected,
+                None,
+                evidence,
+            )
+
+        entry = _optional_decimal(position.avg_entry_price)
+        observed = str(stop_loss)
+        evidence |= {
+            "planned_stop_loss_price": observed,
+            "avg_entry_price": str(entry) if entry is not None else None,
+            "observed": observed,
+        }
+        if entry is None or entry <= Decimal("0"):
+            return (
+                "unknown",
+                "Average entry price was unavailable for stop-loss validation.",
+                None,
+                "entry",
+                expected,
+                observed,
+                evidence,
+            )
+
+        direction_valid = (
+            stop_loss < entry if position.direction == "long" else stop_loss > entry
+        )
+        if not direction_valid:
+            return (
+                "failed",
+                (
+                    f"Planned stop-loss {stop_loss} is invalid for a "
+                    f"{position.direction} entry at {entry}."
+                ),
+                None,
+                "entry",
+                expected,
+                observed,
+                evidence,
+            )
+
+        distance_percent = (abs(entry - stop_loss) / entry) * Decimal("100")
+        evidence["distance_percent"] = str(distance_percent)
+        if max_distance is not None and distance_percent > max_distance:
+            return (
+                "failed",
+                f"Stop-loss distance {distance_percent}% exceeds the limit of {max_distance}%.",
+                None,
+                "entry",
+                expected,
+                observed,
+                evidence,
+            )
+
+        return (
+            "passed",
+            f"Planned stop-loss {stop_loss} is valid for this {position.direction} position.",
+            None,
+            "entry",
+            expected,
+            observed,
+            evidence,
+        )
+
+    def _base_rule_evidence(
+        self,
+        config: dict[str, Any],
+        position: FuturesPosition,
+        timeframe: str | None,
+        anchor: str | None,
+        expected: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "timeframe": timeframe,
+            "anchor": anchor,
+            "direction_scope": config.get("direction_scope", "all"),
+            "position_direction": position.direction,
+            "expected": expected,
+            "applies": True,
+        }
+
+    @staticmethod
+    def _direction_applies(config: dict[str, Any], position: FuturesPosition) -> bool:
+        direction_scope = str(config.get("direction_scope") or "all")
+        return direction_scope == "all" or direction_scope == position.direction
+
+    def _compare_rule_value(
+        self,
+        observed_value: Any,
+        expected_value: Any,
+        operator: str,
+        numeric: bool,
+    ) -> bool:
+        if numeric:
+            observed = _optional_decimal(observed_value)
+            expected = _optional_decimal(expected_value)
+            if observed is None or expected is None:
+                return False
+            return self._compare_decimal(observed=observed, expected=expected, operator=operator)
+
+        observed_text = str(observed_value)
+        if operator in {"in", "not_in"}:
+            expected_values = _list_value(expected_value)
+            result = observed_text in expected_values
+        else:
+            expected_text = str(expected_value)
+            result = observed_text == expected_text
+
+        if operator == "eq":
+            return result
+        if operator == "neq":
+            return not result
+        if operator == "in":
+            return result
+        if operator == "not_in":
+            return not result
+        return False
+
+    @staticmethod
+    def _compare_decimal(observed: Decimal, expected: Decimal, operator: str) -> bool:
+        if operator == "lt":
+            return observed < expected
+        if operator == "lte":
+            return observed <= expected
+        if operator == "gt":
+            return observed > expected
+        if operator == "gte":
+            return observed >= expected
+        if operator == "eq":
+            return observed == expected
+        if operator == "neq":
+            return observed != expected
+        return False
 
     @staticmethod
     def _summarize(items: list[TradingPlanEvaluationItem]) -> TradingPlanEvaluation:
@@ -282,6 +669,12 @@ def _string_list(config: dict[str, Any], key: str, uppercase: bool = False) -> l
     if uppercase:
         return [value.upper() for value in values]
     return values
+
+
+def _list_value(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()] if str(value).strip() else []
 
 
 def _integer_limit(config: dict[str, Any]) -> int | None:

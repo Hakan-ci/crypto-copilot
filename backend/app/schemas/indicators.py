@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class IndicatorSnapshotRead(BaseModel):
@@ -26,11 +26,17 @@ class IndicatorSnapshotRead(BaseModel):
     atr_14: Decimal | None = None
     volume_relative: Decimal | None = None
     trend_label: str | None = None
+    candlestick_patterns: list[str] = Field(default_factory=list)
 
     @field_validator("anchor", mode="before")
     @classmethod
     def default_missing_anchor(cls, value: str | None) -> str:
         return value or "entry"
+
+    @field_validator("candlestick_patterns", mode="before")
+    @classmethod
+    def default_missing_patterns(cls, value: list[str] | None) -> list[str]:
+        return value or []
 
 
 class IndicatorSnapshotCalculationRequest(BaseModel):

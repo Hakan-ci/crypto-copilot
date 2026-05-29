@@ -376,7 +376,9 @@ def test_positions_include_trading_plan_summary(monkeypatch):
     )
     monkeypatch.setattr(
         "app.services.trading_plan_service.TradingPlanService.evaluate_position",
-        lambda self, plan, position, snapshots, positions_for_daily_count: evaluation,
+        (
+            lambda self, plan, position, snapshots, positions_for_daily_count, **kwargs: evaluation
+        ),
     )
 
     listed = make_engine(positions=[position]).list_positions(user_id=user_id)

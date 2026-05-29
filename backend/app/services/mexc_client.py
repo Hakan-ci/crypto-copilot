@@ -14,7 +14,7 @@ from app.core.constants import (
     MEXC_SIDE_OPEN_SHORT,
     SUPPORTED_TIMEFRAMES,
 )
-from app.schemas.mexc import CandleDTO, MexcOrderDealDTO
+from app.schemas.mexc import CandleDTO, MexcOrderDealDTO, MexcStopOrderDTO
 
 MEXC_SIDE_LABELS = {
     MEXC_SIDE_OPEN_LONG: "open_long",
@@ -25,8 +25,10 @@ MEXC_SIDE_LABELS = {
 
 KLINE_PATH_TEMPLATE = "/api/v1/contract/kline/{symbol}"
 ORDER_DEALS_PATH = "/api/v1/private/order/list/order_deals/v3"
+STOP_ORDERS_PATH = "/api/v1/private/stoporder/list/orders"
 PING_PATH = "/api/v1/contract/ping"
 MAX_ORDER_DEALS_PAGE_SIZE = 1000
+MAX_STOP_ORDERS_PAGE_SIZE = 100
 
 
 class MexcApiError(RuntimeError):
@@ -160,6 +162,55 @@ class MexcFuturesClient:
                 return
             page_num += 1
 
+    async def get_stop_orders(
+        self,
+        symbol: str,
+        is_finished: int | None = None,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        page_num: int = 1,
+        page_size: int = MAX_STOP_ORDERS_PAGE_SIZE,
+    ) -> list[MexcStopOrderDTO]:
+        self._validate_stop_orders_pagination(page_num=page_num, page_size=page_size)
+        params = {
+            "symbol": symbol,
+            "is_finished": is_finished,
+            "start_time": start_time_ms,
+            "end_time": end_time_ms,
+            "page_num": page_num,
+            "page_size": page_size,
+        }
+        payload = await self._get_private(STOP_ORDERS_PATH, params)
+        items = self._extract_stop_orders(payload)
+        return [self._parse_stop_order(item) for item in items]
+
+    async def iter_stop_orders(
+        self,
+        symbol: str,
+        is_finished: int | None = None,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> AsyncIterator[MexcStopOrderDTO]:
+        page_num = 1
+        while True:
+            orders = await self.get_stop_orders(
+                symbol=symbol,
+                is_finished=is_finished,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+                page_num=page_num,
+                page_size=MAX_STOP_ORDERS_PAGE_SIZE,
+            )
+            if not orders:
+                return
+
+            for order in orders:
+                yield order
+
+            if len(orders) < MAX_STOP_ORDERS_PAGE_SIZE:
+                return
+            page_num += 1
+
     async def _get(
         self,
         path: str,
@@ -289,6 +340,33 @@ class MexcFuturesClient:
             raw_json=dict(item),
         )
 
+    def _parse_stop_order(self, item: Any) -> MexcStopOrderDTO:
+        if not isinstance(item, dict):
+            raise MexcApiError("MEXC stop order item must be an object.")
+
+        return MexcStopOrderDTO(
+            stop_order_id=str(self._required(item, "stop_order_id", "stopPlanOrderId", "id")),
+            symbol=str(self._required(item, "symbol")),
+            order_id=self._optional(item, "order_id", "orderId"),
+            position_id=self._optional(item, "position_id", "positionId"),
+            stop_loss_price=self._optional_decimal(item, "stop_loss_price", "stopLossPrice"),
+            take_profit_price=self._optional_decimal(
+                item,
+                "take_profit_price",
+                "takeProfitPrice",
+            ),
+            state=self._optional_int(item, "state"),
+            trigger_side=self._optional_int(item, "trigger_side", "triggerSide"),
+            position_type=self._optional_int(item, "position_type", "positionType"),
+            vol=self._optional_decimal(item, "vol"),
+            reality_vol=self._optional_decimal(item, "reality_vol", "realityVol"),
+            place_order_id=self._optional(item, "place_order_id", "placeOrderId"),
+            is_finished=self._optional_int(item, "is_finished", "isFinished"),
+            create_time_ms=self._optional_timestamp_ms(item, "create_time_ms", "createTime"),
+            update_time_ms=self._optional_timestamp_ms(item, "update_time_ms", "updateTime"),
+            raw_json=dict(item),
+        )
+
     def _extract_data(self, payload: Any) -> Any:
         if isinstance(payload, dict) and "data" in payload:
             return payload["data"]
@@ -303,6 +381,16 @@ class MexcFuturesClient:
             if isinstance(result_list, list):
                 return result_list
         raise MexcApiError("MEXC order deals response is missing data.resultList.")
+
+    def _extract_stop_orders(self, payload: Any) -> list[dict[str, Any]]:
+        data = self._extract_data(payload)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            result_list = data.get("resultList")
+            if isinstance(result_list, list):
+                return result_list
+        raise MexcApiError("MEXC stop orders response is missing data.")
 
     def _raise_for_mexc_error(self, payload: Any) -> None:
         if not isinstance(payload, dict):
@@ -323,6 +411,12 @@ class MexcFuturesClient:
             raise ValueError("page_num must be greater than or equal to 1.")
         if page_size < 1 or page_size > MAX_ORDER_DEALS_PAGE_SIZE:
             raise ValueError("page_size must be between 1 and 1000.")
+
+    def _validate_stop_orders_pagination(self, page_num: int, page_size: int) -> None:
+        if page_num < 1:
+            raise ValueError("page_num must be greater than or equal to 1.")
+        if page_size < 1 or page_size > MAX_STOP_ORDERS_PAGE_SIZE:
+            raise ValueError("page_size must be between 1 and 100.")
 
     def _timestamp_to_seconds(self, value: Any) -> int:
         timestamp = int(value)
@@ -360,6 +454,19 @@ class MexcFuturesClient:
                 return value.lower() in {"true", "1", "yes"}
             return bool(value)
         return None
+
+    def _optional_decimal(self, item: dict[str, Any], *keys: str) -> Decimal | None:
+        value = self._optional(item, *keys)
+        return Decimal(value) if value is not None else None
+
+    def _optional_timestamp_ms(self, item: dict[str, Any], *keys: str) -> int | None:
+        value = self._optional(item, *keys)
+        if value is None or value == "":
+            return None
+        timestamp = int(value)
+        if timestamp and timestamp < 1_000_000_000_000:
+            return timestamp * 1000
+        return timestamp
 
     def _decimal(self, value: Any) -> Decimal:
         if value is None:

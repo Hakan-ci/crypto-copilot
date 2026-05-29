@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from app.db.models import Candle, FuturesPosition, IndicatorSnapshot
-from app.services.indicator_engine import IndicatorEngine
+from app.services.indicator_engine import SUPERTREND_MULTIPLIER, IndicatorEngine
 
 
 class FakeTransaction(AbstractContextManager["FakeTransaction"]):
@@ -169,6 +169,7 @@ def test_macd_produces_macd_signal_and_histogram():
 def test_supertrend_returns_value_and_direction():
     snapshot = run_engine(make_candles(80))
 
+    assert SUPERTREND_MULTIPLIER == Decimal("1")
     assert snapshot.supertrend_value is not None
     assert snapshot.supertrend_direction in {"bullish", "bearish"}
 
@@ -282,6 +283,22 @@ def test_closed_position_gets_entry_and_exit_snapshots():
     assert [snapshot.anchor for snapshot in db.snapshots] == ["entry", "exit"]
     assert db.snapshots[0].timestamp == candles[60].timestamp
     assert db.snapshots[1].timestamp == candles[80].timestamp
+
+
+def test_snapshot_detects_candlestick_patterns():
+    candles = make_candles(30)
+    candles[-2].open = Decimal("110")
+    candles[-2].high = Decimal("111")
+    candles[-2].low = Decimal("99")
+    candles[-2].close = Decimal("100")
+    candles[-1].open = Decimal("99")
+    candles[-1].high = Decimal("113")
+    candles[-1].low = Decimal("98")
+    candles[-1].close = Decimal("112")
+
+    snapshot = run_engine(candles)
+
+    assert "bullish_engulfing" in snapshot.candlestick_patterns
 
 
 def test_decimal_conversion_does_not_break_database_insert():

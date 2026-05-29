@@ -17,12 +17,15 @@ from app.schemas.trades import (
     AiTradeQuestionRead,
     AiTradeQuestionRequest,
     IndicatorObservations,
+    PositionTradeMetadataRead,
+    PositionTradeMetadataUpsert,
     TimeframeAlignment,
     TradeReviewOutput,
     TradeReviewRequest,
     TradeReviewResponse,
 )
 from app.services.ai_review_engine import OpenAiNotConfiguredError
+from app.services.trade_metadata_service import TradeMetadataPositionNotFoundError
 
 
 def make_settings() -> Settings:
@@ -167,10 +170,16 @@ def test_review_position_ignores_request_user_rules(monkeypatch):
         def __init__(self, db, openai_api_key, model):
             _ = (db, openai_api_key, model)
 
-        async def generate_review(self, position_id, similar_past_trade_stats=None):
+        async def generate_review(
+            self,
+            position_id,
+            review_timeframe="Hour4",
+            similar_past_trade_stats=None,
+        ):
             calls.append(
                 {
                     "position_id": position_id,
+                    "review_timeframe": review_timeframe,
                     "similar_past_trade_stats": similar_past_trade_stats,
                 }
             )
@@ -202,12 +211,23 @@ def test_review_position_ignores_request_user_rules(monkeypatch):
                 ),
             )
 
+    class FakeTradeMetadataService:
+        def __init__(self, db):
+            _ = db
+
+        async def sync_stop_loss_from_mexc(self, position_id, client):
+            calls.append({"sync_position_id": position_id, "client": client})
+            return None
+
     monkeypatch.setattr(trade_routes, "AiReviewEngine", FakeAiReviewEngine)
+    monkeypatch.setattr(trade_routes, "TradeMetadataService", FakeTradeMetadataService)
+    monkeypatch.setattr(trade_routes, "build_mexc_client", lambda settings: "mexc-client")
 
     asyncio.run(
         trade_routes.review_position(
             position_id=position_id,
             request=TradeReviewRequest(
+                review_timeframe="Hour4",
                 user_rules={"notes": "browser-only override"},
                 similar_past_trade_stats={"wins": 1},
             ),
@@ -217,8 +237,10 @@ def test_review_position_ignores_request_user_rules(monkeypatch):
     )
 
     assert calls == [
+        {"sync_position_id": position_id, "client": "mexc-client"},
         {
             "position_id": position_id,
+            "review_timeframe": "Hour4",
             "similar_past_trade_stats": {"wins": 1},
         }
     ]
@@ -252,7 +274,17 @@ def test_ai_question_routes_delegate_and_map_missing_key(monkeypatch):
             _ = (position_id, question)
             raise OpenAiNotConfiguredError("OpenAI API key is missing.")
 
+    class FakeTradeMetadataService:
+        def __init__(self, db):
+            _ = db
+
+        async def sync_stop_loss_from_mexc(self, position_id, client):
+            _ = (position_id, client)
+            return None
+
     monkeypatch.setattr(trade_routes, "AiReviewEngine", FakeAiReviewEngine)
+    monkeypatch.setattr(trade_routes, "TradeMetadataService", FakeTradeMetadataService)
+    monkeypatch.setattr(trade_routes, "build_mexc_client", lambda settings: object())
 
     questions = trade_routes.list_ai_questions(
         position_id=position_id,
@@ -271,3 +303,89 @@ def test_ai_question_routes_delegate_and_map_missing_key(monkeypatch):
             )
         )
     assert exc_info.value.status_code == 503
+
+
+def test_trade_metadata_routes_delegate_and_map_missing_position(monkeypatch):
+    position_id = uuid4()
+    metadata_id = uuid4()
+    created_at = datetime.fromtimestamp(1_710_000_000, tz=UTC)
+    metadata = PositionTradeMetadataRead(
+        id=metadata_id,
+        position_id=position_id,
+        planned_stop_loss_price=Decimal("98"),
+        notes="Planned before entry.",
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    calls: list[tuple[str, object]] = []
+
+    class FakeTradeMetadataService:
+        def __init__(self, db):
+            calls.append(("init", db))
+
+        def read_metadata(self, position_id):
+            calls.append(("read", position_id))
+            return metadata
+
+        async def sync_stop_loss_from_mexc(self, position_id, client):
+            calls.append(("sync", position_id))
+            return metadata
+
+        def upsert_metadata(self, position_id, payload):
+            calls.append(("upsert", payload))
+            return metadata
+
+    monkeypatch.setattr(trade_routes, "TradeMetadataService", FakeTradeMetadataService)
+    monkeypatch.setattr(trade_routes, "build_mexc_client", lambda settings: object())
+
+    assert (
+        asyncio.run(
+            trade_routes.get_position_trade_metadata(
+                position_id=position_id,
+                db=object(),
+                settings=make_settings(),
+            )
+        )
+        == metadata
+    )
+    assert (
+        trade_routes.put_position_trade_metadata(
+            position_id=position_id,
+            payload=PositionTradeMetadataUpsert(planned_stop_loss_price=Decimal("98")),
+            db=object(),
+        )
+        == metadata
+    )
+    assert calls[1] == ("sync", position_id)
+    assert calls[3][0] == "upsert"
+
+    class MissingTradeMetadataService:
+        def __init__(self, db):
+            _ = db
+
+        def read_metadata(self, position_id):
+            raise TradeMetadataPositionNotFoundError(f"Position not found: {position_id}")
+
+        async def sync_stop_loss_from_mexc(self, position_id, client):
+            raise TradeMetadataPositionNotFoundError(f"Position not found: {position_id}")
+
+        def upsert_metadata(self, position_id, payload):
+            raise TradeMetadataPositionNotFoundError(f"Position not found: {position_id}")
+
+    monkeypatch.setattr(trade_routes, "TradeMetadataService", MissingTradeMetadataService)
+    with pytest.raises(trade_routes.HTTPException) as get_exc:
+        asyncio.run(
+            trade_routes.get_position_trade_metadata(
+                position_id=position_id,
+                db=object(),
+                settings=make_settings(),
+            )
+        )
+    with pytest.raises(trade_routes.HTTPException) as put_exc:
+        trade_routes.put_position_trade_metadata(
+            position_id=position_id,
+            payload=PositionTradeMetadataUpsert(planned_stop_loss_price=Decimal("98")),
+            db=object(),
+        )
+    assert get_exc.value.status_code == 404
+    assert put_exc.value.status_code == 404

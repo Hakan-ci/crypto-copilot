@@ -5,8 +5,11 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.core.constants import SUPPORTED_TIMEFRAMES
 from app.schemas.indicators import IndicatorSnapshotRead
 from app.schemas.trading_plan import TradingPlanEvaluation, TradingPlanReviewContext
+
+DEFAULT_REVIEW_TIMEFRAME = "Hour4"
 
 
 class FuturesPositionRead(BaseModel):
@@ -104,11 +107,36 @@ class PositionTransactionRead(BaseModel):
     source: Literal["linked", "inferred"]
 
 
+class PositionTradeMetadataRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    position_id: UUID
+    planned_stop_loss_price: Decimal | None = None
+    notes: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PositionTradeMetadataUpsert(BaseModel):
+    planned_stop_loss_price: Decimal | None = Field(default=None, ge=0)
+    notes: str | None = None
+
+    @field_validator("notes")
+    @classmethod
+    def normalize_notes(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
 class PositionDetail(BaseModel):
     position: FuturesPositionRead
     indicator_snapshots: list[IndicatorSnapshotRead]
     ai_review: AiTradeReviewRead | None = None
     plan_evaluation: TradingPlanEvaluation | None = None
+    trade_metadata: PositionTradeMetadataRead | None = None
     transaction_timeline: list[PositionTransactionRead] = Field(default_factory=list)
     transaction_timeline_source: Literal["linked", "inferred", "unavailable"] = "unavailable"
 
@@ -146,6 +174,7 @@ class TradeReviewIndicatorSnapshotInput(BaseModel):
     atr_14: Decimal | None = None
     volume_relative: Decimal | None = None
     trend_label: str | None = None
+    candlestick_patterns: list[str] = Field(default_factory=list)
 
 
 class UserTradingRules(BaseModel):
@@ -158,12 +187,15 @@ class UserTradingRules(BaseModel):
 
 
 class TradeReviewInput(BaseModel):
+    review_timeframe: str = DEFAULT_REVIEW_TIMEFRAME
     position: TradeReviewPositionInput
     indicator_snapshots: list[TradeReviewIndicatorSnapshotInput]
     transaction_timeline: list[PositionTransactionRead] = Field(default_factory=list)
     transaction_timeline_source: Literal["linked", "inferred", "unavailable"] = "unavailable"
+    trade_metadata: PositionTradeMetadataRead | None = None
     trading_plan: TradingPlanReviewContext | None = None
     plan_evaluation: TradingPlanEvaluation | None = None
+    rule_evidence: list[dict[str, Any]] = Field(default_factory=list)
     user_rules: UserTradingRules | None = None
     similar_past_trade_stats: dict[str, Any] | None = None
 
@@ -180,6 +212,20 @@ class IndicatorObservations(BaseModel):
     stoch_rsi: list[str]
     macd: list[str]
     supertrend: list[str]
+
+
+class TradingPlanRuleResult(BaseModel):
+    title: str
+    status: Literal["followed", "not_followed"]
+    reason: str
+
+    @field_validator("title", "reason")
+    @classmethod
+    def require_non_empty_rule_text(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Rule result text fields must not be empty.")
+        return stripped
 
 
 class TradeReviewOutput(BaseModel):
@@ -201,6 +247,9 @@ class TradeReviewOutput(BaseModel):
     execution_notes: list[str] = Field(default_factory=list)
     missed_context: list[str] = Field(default_factory=list)
     follow_up_questions: list[str] = Field(default_factory=list)
+    abandoned_rules: list[str] = Field(default_factory=list)
+    rule_violations: list[str] = Field(default_factory=list)
+    trading_plan_rule_results: list[TradingPlanRuleResult] = Field(default_factory=list)
 
     @field_validator("summary", "final_note")
     @classmethod
@@ -211,8 +260,16 @@ class TradeReviewOutput(BaseModel):
 
 
 class TradeReviewRequest(BaseModel):
+    review_timeframe: str = DEFAULT_REVIEW_TIMEFRAME
     user_rules: UserTradingRules | None = None
     similar_past_trade_stats: dict[str, Any] | None = None
+
+    @field_validator("review_timeframe")
+    @classmethod
+    def validate_review_timeframe(cls, value: str) -> str:
+        if value not in SUPPORTED_TIMEFRAMES:
+            raise ValueError(f"Unsupported review timeframe: {value}")
+        return value
 
 
 class TradeReviewResponse(BaseModel):

@@ -15,8 +15,47 @@ TradingPlanRuleType = Literal[
     "max_leverage",
     "max_risk_per_trade",
     "min_risk_reward",
+    "indicator_condition",
+    "candlestick_pattern",
+    "stop_loss",
 ]
 TradingPlanEvaluationStatus = Literal["passed", "failed", "unknown", "manual"]
+
+SUPPORTED_INDICATOR_RULE_FIELDS = {
+    "rsi_14",
+    "stoch_rsi_k",
+    "stoch_rsi_d",
+    "macd",
+    "macd_signal",
+    "macd_histogram",
+    "supertrend_direction",
+    "trend_label",
+    "atr_14",
+    "volume_relative",
+}
+NUMERIC_INDICATOR_FIELDS = {
+    "rsi_14",
+    "stoch_rsi_k",
+    "stoch_rsi_d",
+    "macd",
+    "macd_signal",
+    "macd_histogram",
+    "atr_14",
+    "volume_relative",
+}
+SUPPORTED_INDICATOR_OPERATORS = {"lt", "lte", "gt", "gte", "eq", "neq", "in", "not_in"}
+SUPPORTED_CANDLESTICK_PATTERNS = {
+    "doji",
+    "hammer",
+    "shooting_star",
+    "bullish_engulfing",
+    "bearish_engulfing",
+    "morning_star",
+    "evening_star",
+}
+SUPPORTED_ANCHORS = {"entry", "exit"}
+SUPPORTED_DIRECTION_SCOPES = {"all", "long", "short"}
+SUPPORTED_PATTERN_MATCH_MODES = {"any", "all"}
 
 NUMERIC_LIMIT_RULE_TYPES = {
     "max_leverage",
@@ -78,6 +117,76 @@ class TradingPlanItemBase(BaseModel):
             limit = _optional_decimal(config, "limit")
             if limit is not None:
                 config["limit"] = str(limit)
+        elif self.rule_type == "indicator_condition":
+            timeframe = _required_string(config, "timeframe")
+            if timeframe not in SUPPORTED_TIMEFRAMES:
+                raise ValueError(f"Unsupported timeframe: {timeframe}")
+            anchor = _optional_string(config, "anchor") or "entry"
+            if anchor not in SUPPORTED_ANCHORS:
+                raise ValueError(f"Unsupported anchor: {anchor}")
+            direction_scope = _optional_string(config, "direction_scope") or "all"
+            if direction_scope not in SUPPORTED_DIRECTION_SCOPES:
+                raise ValueError(f"Unsupported direction scope: {direction_scope}")
+            indicator = _required_string(config, "indicator")
+            if indicator not in SUPPORTED_INDICATOR_RULE_FIELDS:
+                raise ValueError(f"Unsupported indicator: {indicator}")
+            operator = _required_string(config, "operator")
+            if operator not in SUPPORTED_INDICATOR_OPERATORS:
+                raise ValueError(f"Unsupported operator: {operator}")
+            value = config.get("value")
+            if value is None or value == "":
+                raise ValueError("Indicator condition value is required.")
+            if indicator in NUMERIC_INDICATOR_FIELDS:
+                if operator not in {"lt", "lte", "gt", "gte", "eq", "neq"}:
+                    raise ValueError(f"Operator {operator} is not supported for {indicator}.")
+                config["value"] = str(_decimal_value(value, "value"))
+            elif operator not in {"eq", "neq", "in", "not_in"}:
+                raise ValueError(f"Operator {operator} is not supported for {indicator}.")
+            config["timeframe"] = timeframe
+            config["anchor"] = anchor
+            config["direction_scope"] = direction_scope
+            config["indicator"] = indicator
+            config["operator"] = operator
+        elif self.rule_type == "candlestick_pattern":
+            timeframe = _required_string(config, "timeframe")
+            if timeframe not in SUPPORTED_TIMEFRAMES:
+                raise ValueError(f"Unsupported timeframe: {timeframe}")
+            anchor = _optional_string(config, "anchor") or "entry"
+            if anchor not in SUPPORTED_ANCHORS:
+                raise ValueError(f"Unsupported anchor: {anchor}")
+            direction_scope = _optional_string(config, "direction_scope") or "all"
+            if direction_scope not in SUPPORTED_DIRECTION_SCOPES:
+                raise ValueError(f"Unsupported direction scope: {direction_scope}")
+            patterns = _optional_string_list(config, "patterns")
+            if not patterns:
+                raise ValueError("At least one candlestick pattern is required.")
+            normalized_patterns = [pattern.lower() for pattern in patterns]
+            invalid_patterns = [
+                pattern
+                for pattern in normalized_patterns
+                if pattern not in SUPPORTED_CANDLESTICK_PATTERNS
+            ]
+            if invalid_patterns:
+                raise ValueError(
+                    "Unsupported candlestick pattern(s): "
+                    f"{', '.join(sorted(set(invalid_patterns)))}"
+                )
+            match_mode = _optional_string(config, "match_mode") or "any"
+            if match_mode not in SUPPORTED_PATTERN_MATCH_MODES:
+                raise ValueError(f"Unsupported pattern match mode: {match_mode}")
+            config["timeframe"] = timeframe
+            config["anchor"] = anchor
+            config["direction_scope"] = direction_scope
+            config["patterns"] = normalized_patterns
+            config["match_mode"] = match_mode
+        elif self.rule_type == "stop_loss":
+            direction_scope = _optional_string(config, "direction_scope") or "all"
+            if direction_scope not in SUPPORTED_DIRECTION_SCOPES:
+                raise ValueError(f"Unsupported direction scope: {direction_scope}")
+            max_distance_percent = _optional_decimal(config, "max_distance_percent")
+            if max_distance_percent is not None:
+                config["max_distance_percent"] = str(max_distance_percent)
+            config["direction_scope"] = direction_scope
         self.config = config
         return self
 
@@ -132,6 +241,11 @@ class TradingPlanEvaluationItem(BaseModel):
     rule_type: TradingPlanRuleType
     status: TradingPlanEvaluationStatus
     message: str
+    timeframe: str | None = None
+    anchor: str | None = None
+    expected: str | None = None
+    observed: str | None = None
+    evidence: dict[str, Any] = Field(default_factory=dict)
 
 
 class TradingPlanEvaluation(BaseModel):
@@ -154,6 +268,20 @@ def _optional_string_list(config: dict[str, Any], key: str) -> list[str] | None:
     return values
 
 
+def _optional_string(config: dict[str, Any], key: str) -> str | None:
+    raw_value = config.get(key)
+    if raw_value is None or raw_value == "":
+        return None
+    return str(raw_value).strip()
+
+
+def _required_string(config: dict[str, Any], key: str) -> str:
+    value = _optional_string(config, key)
+    if value is None:
+        raise ValueError(f"{key} is required.")
+    return value
+
+
 def _optional_decimal(config: dict[str, Any], key: str) -> Decimal | None:
     raw_value = config.get(key)
     if raw_value is None or raw_value == "":
@@ -166,4 +294,14 @@ def _optional_decimal(config: dict[str, Any], key: str) -> Decimal | None:
         raise ValueError(f"{key} must be finite.")
     if value < Decimal("0"):
         raise ValueError(f"{key} must not be negative.")
+    return value
+
+
+def _decimal_value(raw_value: Any, key: str) -> Decimal:
+    try:
+        value = Decimal(str(raw_value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"{key} must be numeric.") from exc
+    if not value.is_finite():
+        raise ValueError(f"{key} must be finite.")
     return value
